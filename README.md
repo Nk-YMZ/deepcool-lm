@@ -4,7 +4,7 @@ A comprehensive Linux driver for Deepcool LM series AIO coolers with LCD display
 
 ![LM360 Display](https://img.shields.io/badge/Resolution-320x240-blue) ![License](https://img.shields.io/badge/License-MIT-green)
 
-![Deepcool LM360 Display Preview](lm360.png)
+![Deepcool LM360 Display Preview](lm240-new.jpg)
 
 > **Note**: This driver is designed for Deepcool LM series coolers. Currently tested and confirmed working on **LM360** only. Other LM series models (LM240, LM280, etc.) may work but have not been tested. Contributions and testing reports are welcome!
 
