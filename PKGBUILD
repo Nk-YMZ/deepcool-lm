@@ -1,7 +1,7 @@
 # Maintainer: Your Name <your.email@example.com>
 pkgname=deepcool-lm
-pkgver=1.0.0
-pkgrel=1
+pkgver=1.1.0
+pkgrel=0
 pkgdesc="Linux driver for Deepcool LM series AIO coolers with LCD display (tested on LM360)"
 arch=('any')
 url="https://github.com/yourusername/deepcool-lm"
