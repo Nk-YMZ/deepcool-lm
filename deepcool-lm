@@ -13,6 +13,7 @@ import socket
 import json
 import os
 import threading
+import re
 from PIL import Image, ImageDraw, ImageFont
 
 VENDOR_ID = 0x3633
@@ -255,6 +256,275 @@ class LM360:
 # System Info & Rendering Functions
 # ============================================================================
 
+def get_cpu_model():
+    """获取 CPU 型号和品牌"""
+    try:
+        with open('/proc/cpuinfo', 'r') as f:
+            content = f.read()
+            
+        match = re.search(r'model name\s*:\s*(.+)', content)
+        if match:
+            full_name = match.group(1).strip()
+            
+            if 'AMD' in full_name:
+                # AMD Ryzen 7 7800X3D 16-Core Processor -> Ryzen 7 7800X3D
+                # 去掉 AMD 前缀，去掉后面多余
+                short = re.sub(r'^AMD\s+', '', full_name)  # 只去掉开头的 AMD
+                short = re.sub(r'\s+\d+-Core.*$', '', short)  # 去掉 "16-Core Processor"
+                short = re.sub(r'\s+Processor.*$', '', short)  # 去掉 "Processor"
+                # 限制长度但保证词完整
+                if len(short) > 15:
+                    short = short[:15].rsplit(' ', 1)[0]
+                return 'AMD', short
+                
+            elif 'Intel' in full_name:
+                # Intel(R) Core(TM) i7-14700K -> Core i7-14700K
+                # Intel(R) Xeon(R) E5-2680 -> Xeon E5-2680
+                short = re.sub(r'Intel\(R\)\s+', '', full_name)
+                short = re.sub(r'Core\(TM\)\s+', 'Core ', short)
+                short = re.sub(r'Xeon\(R\)\s+', 'Xeon ', short)
+                short = re.sub(r'Pentium\(R\)\s+', 'Pentium ', short)
+                short = re.sub(r'Celeron\(R\)\s+', 'Celeron ', short)
+                short = re.sub(r'\s+CPU.*$', '', short)  # 去掉 "CPU @ 3.50GHz"
+                short = re.sub(r'\s+@.*$', '', short)    # 去掉 "@ 3.50GHz"
+                if len(short) > 15:
+                    short = short[:15].rsplit(' ', 1)[0]
+                return 'Intel', short
+            else:
+                short = full_name[:15]
+                return 'Unknown', short
+    except Exception as e:
+        print(f"CPU detection error: {e}")
+    return 'Unknown', 'Unknown'
+
+# def get_gpu_model():
+    """获取 GPU 型号和品牌"""
+    gpu_info = {'brand': 'Unknown', 'model': 'Unknown', 'temp_source': None}
+    
+    try:
+        temps = psutil.sensors_temperatures()
+        
+        # 1. 检查 AMD GPU
+        if 'amdgpu' in temps:
+            gpu_info['brand'] = 'AMD'
+            gpu_info['temp_source'] = 'amdgpu'
+            try:
+                import subprocess
+                result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
+                for line in result.stdout.split('\n'):
+                    if ('VGA' in line or '3D controller' in line) and ('AMD' in line or 'ATI' in line):
+                        # 示例: "VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]"
+                        # 提取方括号后的部分
+                        if ']' in line:
+                            model_part = line.split(']')[-1].strip()
+                            # 去掉 [Radeon RX 7900 XTX] 中的括号内容，保留主要名称
+                            model = re.sub(r'\[.*?\]', '', model_part)
+                            model = model.strip()
+                            # 精简: Radeon RX 7900 XTX -> RX 7900 XTX
+                            model = re.sub(r'^Radeon\s+', '', model)
+                            if len(model) > 15:
+                                model = model[:15].rsplit(' ', 1)[0]
+                            gpu_info['model'] = model if model else 'Radeon'
+                        else:
+                            gpu_info['model'] = 'Radeon'
+                        break
+            except:
+                gpu_info['model'] = 'Radeon'
+            return gpu_info
+        
+        # 2. 检查 NVIDIA（nvidia-smi）
+        try:
+            import subprocess
+            result = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                                  capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and result.stdout.strip():
+                name = result.stdout.strip()
+                gpu_info['brand'] = 'NVIDIA'
+                gpu_info['temp_source'] = 'nvidia-smi'
+                # 简化型号 - 先匹配长的，再匹配短的
+                # "NVIDIA GeForce RTX 4090" -> "RTX 4090"
+                # "NVIDIA RTX A6000" -> "RTX A6000"  
+                # "NVIDIA TITAN Xp" -> "TITAN Xp"
+                # "GeForce GTX 1080 Ti" -> "GTX 1080 Ti"
+                
+                short = name
+                
+                # 完整前缀
+                short = re.sub(r'^NVIDIA\s+GeForce\s+', '', short)
+                short = re.sub(r'^NVIDIA\s+', '', short)
+                short = re.sub(r'^GeForce\s+', '', short)  # 有些输出不带 NVIDIA 前缀
+                
+                # 其他前缀
+                short = re.sub(r'^Quadro\s+', '', short)
+                short = re.sub(r'^Tesla\s+', '', short)
+                short = re.sub(r'^TITAN\s+', 'TITAN ', short)  # 保留 TITAN 名称
+                
+                if len(short) > 15:
+                    short = short[:15].rsplit(' ', 1)[0]
+                gpu_info['model'] = short if short else 'NVIDIA'
+                return gpu_info
+        except:
+            pass
+        
+        # 3. 检查 nouveau
+        if 'nouveau' in temps:
+            gpu_info['brand'] = 'NVIDIA'
+            gpu_info['temp_source'] = 'nouveau'
+            gpu_info['model'] = 'NVIDIA'
+            return gpu_info
+        
+        # 4. 检查 Intel
+        if 'i915' in temps:
+            gpu_info['brand'] = 'Intel'
+            gpu_info['temp_source'] = 'i915'
+            gpu_info['model'] = 'Integrated'
+            return gpu_info
+            
+    except Exception as e:
+        print(f"GPU detection error: {e}")
+    
+    return gpu_info
+
+def get_gpu_model():
+    """获取 GPU 型号和品牌"""
+    gpu_info = {'brand': 'Unknown', 'model': 'Unknown', 'temp_source': None}
+    
+    try:
+        temps = psutil.sensors_temperatures()
+        
+        # 1. 检查 AMD GPU
+        if 'amdgpu' in temps:
+            gpu_info['brand'] = 'AMD'
+            gpu_info['temp_source'] = 'amdgpu'
+            try:
+                import subprocess
+                result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
+                for line in result.stdout.split('\n'):
+                    if ('VGA' in line or '3D controller' in line) and ('AMD' in line or 'ATI' in line):
+                        # 示例: "VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]"
+                        # 提取方括号后的部分
+                        if ']' in line:
+                            model_part = line.split(']')[-1].strip()
+                            # 去掉 [Radeon RX 7900 XTX] 中的括号内容，保留主要名称
+                            model = re.sub(r'\[.*?\]', '', model_part)
+                            model = model.strip()
+                            # 精简: Radeon RX 7900 XTX -> RX 7900 XTX
+                            model = re.sub(r'^Radeon\s+', '', model)
+                            if len(model) > 15:
+                                model = model[:15].rsplit(' ', 1)[0]
+                            gpu_info['model'] = model if model else 'Radeon'
+                        else:
+                            gpu_info['model'] = 'Radeon'
+                        break
+            except:
+                gpu_info['model'] = 'Radeon'
+            return gpu_info
+        
+        # 2. 检查 NVIDIA（nvidia-smi）
+        try:
+            import subprocess
+            result = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                                  capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and result.stdout.strip():
+                name = result.stdout.strip()
+                gpu_info['brand'] = 'NVIDIA'
+                gpu_info['temp_source'] = 'nvidia-smi'
+                # 保留完整名称，不再截断
+                # 简化型号 - 先匹配长的，再匹配短的
+                # "NVIDIA GeForce RTX 4090" -> "RTX 4090"
+                # "NVIDIA RTX A6000" -> "RTX A6000"  
+                # "NVIDIA TITAN Xp" -> "TITAN Xp"
+                # "GeForce GTX 1080 Ti" -> "GTX 1080 Ti"
+                
+                short = name
+                
+                # 完整前缀
+                short = re.sub(r'^NVIDIA\s+GeForce\s+', '', short)
+                short = re.sub(r'^NVIDIA\s+', '', short)
+                short = re.sub(r'^GeForce\s+', '', short)  # 有些输出不带 NVIDIA 前缀
+                
+                # 其他前缀
+                short = re.sub(r'^Quadro\s+', '', short)
+                short = re.sub(r'^Tesla\s+', '', short)
+                short = re.sub(r'^TITAN\s+', 'TITAN ', short)  # 保留 TITAN 名称
+                
+                # 关键修改：保留完整型号，不再按长度截断
+                gpu_info['model'] = short if short else 'NVIDIA'
+                return gpu_info
+        except:
+            pass
+        
+        # 3. 检查 nouveau
+        if 'nouveau' in temps:
+            gpu_info['brand'] = 'NVIDIA'
+            gpu_info['temp_source'] = 'nouveau'
+            gpu_info['model'] = 'NVIDIA'
+            return gpu_info
+        
+        # 4. 检查 Intel
+        if 'i915' in temps:
+            gpu_info['brand'] = 'Intel'
+            gpu_info['temp_source'] = 'i915'
+            gpu_info['model'] = 'Integrated'
+            return gpu_info
+            
+    except Exception as e:
+        print(f"GPU detection error: {e}")
+    
+    return gpu_info
+
+def parse_gpu_model(model):
+    """
+    解析 GPU 型号，分离基础型号和后缀
+    例如: "RTX 4070 Ti Super" -> ("RTX 4070", "Ti Super")
+          "RX 7900 XTX" -> ("RX 7900", "XTX")
+    """
+    model = model.strip()
+    
+    # 先标准化：确保 Ti/Super/XTX 前有空格
+    model = re.sub(r'(\d)(Ti|Super|XTX|XT|GRE)', r'\1 \2', model)
+    model = re.sub(r'(Ti)(Super)', r'\1 \2', model)
+    
+    # 匹配基础型号：前缀 + 数字（必须结束或跟空格）
+    match = re.match(r'^((?:RTX|RX|GTX|R\d+|Pro)?\s*\d{3,4})\b(.*)', model)
+    
+    if match:
+        base = match.group(1).strip()
+        suffix = match.group(2).strip()
+        
+        # 如果基础型号还包含 Ti（不应该），分离出来
+        if 'Ti' in base and 'Ti' in suffix:
+            base = base.replace('Ti', '').strip()
+        
+        return base, suffix
+    
+    return model, ""
+
+def get_brand_color(brand):
+    """返回品牌对应颜色"""
+    colors = {
+        'AMD': (255, 50, 50),      # 红色
+        'Intel': (100, 150, 255),  # 蓝色
+        'NVIDIA': (100, 255, 100), # 绿色
+    }
+    return colors.get(brand, (150, 150, 150))  # 默认灰色
+
+_cpu_cache = None
+_gpu_cache = None
+
+def get_cached_cpu_info():
+    global _cpu_cache
+    if _cpu_cache is None:
+        brand, model = get_cpu_model()
+        _cpu_cache = (brand, model, get_brand_color(brand))
+    return _cpu_cache
+
+def get_cached_gpu_info():
+    global _gpu_cache
+    if _gpu_cache is None:
+        _gpu_cache = get_gpu_model()
+    return _gpu_cache
+
 def get_temp_color(temp):
     """Return color gradient based on temperature"""
     if temp < 40:
@@ -267,6 +537,30 @@ def get_temp_color(temp):
         return (255, 140, 0)    # Orange
     else:
         return (255, 50, 50)    # Red
+
+def get_usage_color(percent):
+    """CPU 使用率颜色: 低(蓝) -> 中(绿) -> 中高(黄) -> 满载(红)"""
+    if percent < 30:
+        return (100, 200, 255)   # 蓝色：低负载 <30%
+    elif percent < 60:
+        return (100, 255, 100)   # 绿色：中负载 30-60%
+    elif percent < 85:
+        return (255, 220, 50)    # 黄色：中高负载 60-85%
+    else:
+        return (255, 50, 50)     # 红色：满载 >=85%
+
+def get_freq_color(freq_ghz):
+    """CPU 频率颜色: 低(蓝) -> 中(绿) -> 中高(黄) -> 高(红)"""
+
+    
+    if freq_ghz < 3.5:
+        return (100, 200, 255)   # 蓝色：低频/节能 <50%
+    elif freq_ghz < 4.5:
+        return (100, 255, 100)   # 绿色：中频 50-75%
+    elif freq_ghz < 5.2:
+        return (255, 220, 50)    # 黄色：中高频 75-90%
+    else:
+        return (255, 50, 50)     # 红色：高频/睿频 >=90%
 
 def load_fonts():
     """Load fonts with fallback"""
@@ -293,10 +587,43 @@ def get_system_info():
     # CPU temperature
     try:
         temps = psutil.sensors_temperatures()
-        if 'coretemp' in temps and len(temps['coretemp']) > 0:
-            info['cpu_temp'] = round(temps['coretemp'][0].current, 1)
-        if 'nvme' in temps and len(temps['nvme']) > 0:
-            info['gpu_temp'] = round(temps['nvme'][0].current, 1)
+        # if 'coretemp' in temps and len(temps['coretemp']) > 0:
+        #     info['cpu_temp'] = round(temps['coretemp'][0].current, 1)
+        # 优先找 AMD 的 k10temp
+        if 'k10temp' in temps:
+            # 遍历所有传感器，寻找 Tctl 或 Tdie
+            found = False
+            for sensor in temps['k10temp']:
+                if sensor.label in ['Tctl', 'Tdie']:
+                    info['cpu_temp'] = round(sensor.current, 1)
+                    found = True
+                    break
+            # 如果没找到标签，才退而求其次用第一个
+            if not found and len(temps['k10temp']) > 0:
+                info['cpu_temp'] = round(temps['k10temp'][0].current, 1)
+
+        # 如果是 Intel 或其他情况 (备用)
+        elif 'coretemp' in temps:
+             if len(temps['coretemp']) > 0:
+                info['cpu_temp'] = round(temps['coretemp'][0].current, 1)
+
+        # if 'nvme' in temps and len(temps['nvme']) > 0:
+        #     info['gpu_temp'] = round(temps['nvme'][0].current, 1)
+        if 'amdgpu' in temps and len(temps['amdgpu']) > 0:
+             info['gpu_temp'] = round(temps['amdgpu'][0].current, 1)
+        if info['gpu_temp'] == 0.0:
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader,nounits'],
+                    capture_output=True, text=True, timeout=2
+                )
+                if result.returncode == 0:
+                    temp_str = result.stdout.strip()
+                    if temp_str:
+                        info['gpu_temp'] = float(temp_str)
+            except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+                pass  # nvidia-smi 不可用或执行失败
     except:
         pass
 
@@ -344,14 +671,48 @@ def render_monitor_display(info, fonts):
     img = Image.new('RGB', (WIDTH, HEIGHT), color=(14, 14, 18))
     draw = ImageDraw.Draw(img)
 
+    # 获取型号信息（带缓存）
+    cpu_brand, cpu_model, cpu_brand_color = get_cached_cpu_info()
+    gpu_info = get_cached_gpu_info()
+
     # === CPU SECTION (Top Half) ===
     cpu_color = get_temp_color(info['cpu_temp'])
+    usage_color = get_usage_color(info['cpu_percent'])
+    freq_color = get_freq_color(info['cpu_freq'])
 
     # CPU rounded border box
     draw_rounded_rect(draw, [12, 10, 308, 125], radius=8, outline=(40, 40, 50), width=2)
 
     # CPU Label (BOLD) with icon and temperature
-    draw.text((20, 20), "⚙ CPU", fill=(110, 110, 130), font=fonts['normal_bold'])
+
+    # 尝试用 normal_bold，如果太长改用 normal
+    icon_text = "⚙ "
+    model_text = cpu_model
+    
+    # 先尝试用 medium 字号（小一点）
+    test_bbox = draw.textbbox((0, 0), icon_text + model_text, font=fonts['normal'])
+    test_w = test_bbox[2] - test_bbox[0]
+    
+    # 如果总宽度超过 200，缩短型号
+    max_width = 200
+    if test_w > max_width:
+        # 尝试缩短：Ryzen 7 7800X3D -> Ryzen 7800X3D 或 R7 7800X3D
+        short_model = model_text.replace("Ryzen ", "R").replace("Core ", "").replace("Xeon ", "")
+        test_bbox = draw.textbbox((0, 0), icon_text + short_model, font=fonts['normal'])
+        test_w = test_bbox[2] - test_bbox[0]
+        
+        if test_w > max_width:
+            # 还是太长，直接截断
+            while test_w > max_width and len(short_model) > 3:
+                short_model = short_model[:-1]
+                test_bbox = draw.textbbox((0, 0), icon_text + short_model + "...", font=fonts['normal'])
+                test_w = test_bbox[2] - test_bbox[0]
+            model_text = short_model + "..."
+        else:
+            model_text = short_model
+    
+    # 使用 normal 字体（比 normal_bold 小）
+    draw.text((20, 22), icon_text + model_text, fill=cpu_brand_color, font=fonts['normal'])
 
     cpu_temp_text = f"{info['cpu_temp']:.0f}°"
     bbox = draw.textbbox((0, 0), cpu_temp_text, font=fonts['medium'])
@@ -359,20 +720,52 @@ def render_monitor_display(info, fonts):
     draw.text((WIDTH - 20 - text_w, 20), cpu_temp_text, fill=cpu_color, font=fonts['medium'])
 
     # CPU Usage details
-    usage_detail = f"Usage: {info['cpu_percent']:.0f}% • {info['cpu_freq']:.2f} GHz"
-    draw.text((20, 68), usage_detail, fill=(130, 130, 150), font=fonts['small'])
+    # usage_detail = f"Usage: {info['cpu_percent']:.0f}% • {info['cpu_freq']:.2f} GHz"
+    # draw.text((20, 68), usage_detail, fill=(130, 130, 150), font=fonts['small'])
+
+    # CPU 使用率详情 - 分颜色显示
+    # "Usage:" 标签用默认色，数值用 usage_color
+    # draw.text((20, 68), "Usage: ", fill=(130, 130, 150), font=fonts['small'])
+    usage_label_text = "Usage: "
+    draw.text((20, 68), usage_label_text, fill=tuple(max(0, c - 30) for c in cpu_brand_color), font=fonts['small'])
+
+    usage_label_bbox = draw.textbbox((0, 0), "Usage:", font=fonts['small'])
+    usage_label_w = usage_label_bbox[2] - usage_label_bbox[0]
+    
+    usage_text = f"{info['cpu_percent']:.0f}%"
+    # bbox = draw.textbbox((0, 0), usage_text, font=fonts['small'])
+    # usage_w = bbox[2] - bbox[0]
+    draw.text((20 + usage_label_w + 2, 68), usage_text, fill=usage_color, font=fonts['small'])
+
+    usage_bbox = draw.textbbox((0, 0), usage_text, font=fonts['small'])
+    usage_w = usage_bbox[2] - usage_bbox[0]
+    
+    # "•" 分隔符用默认色
+    separator_x = 20 + usage_label_w + 2 + usage_w + 4
+    draw.text((separator_x, 68), "•", fill=(130, 130, 150), font=fonts['small'])
+
+    # 计算分隔符宽度
+    sep_bbox = draw.textbbox((0, 0), "•", font=fonts['small'])
+    sep_w = sep_bbox[2] - sep_bbox[0]
+    
+    # 频率值用 freq_color
+    freq_text = f"{info['cpu_freq']:.2f} GHz"
+    draw.text((separator_x + sep_w + 4, 68), freq_text, fill=freq_color, font=fonts['small'])
 
     # CPU Progress bar - full width with rounded corners
     bar_x, bar_y, bar_w, bar_h = 23, 93, WIDTH - 46, 18
     bar_radius = bar_h // 2  # Fully rounded (half the height)
     draw_rounded_rect(draw, [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
                       radius=bar_radius, fill=(30, 30, 38), outline=None)
-    fill_w = int(bar_w * (info['cpu_percent'] / 100.0))
+    temp_ratio = min(info['cpu_temp'], 100.0) / 100.0
+    fill_w = int(bar_w * temp_ratio)
     if fill_w >= bar_radius * 2:  # Only draw if wide enough for rounded corners
-        bar_color = (100, 180, 255) if info['cpu_percent'] < 75 else (255, 150, 50)
+        # bar_color = (100, 180, 255) if info['cpu_percent'] < 75 else (255, 150, 50)
+        # draw_rounded_rect(draw, [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
+        #                   radius=bar_radius, fill=bar_color, outline=None)
         draw_rounded_rect(draw, [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
-                          radius=bar_radius, fill=bar_color, outline=None)
-
+                            radius=bar_radius, fill=cpu_color, outline=None)
+        
     # === GPU SECTION (Bottom Half) ===
     gpu_color = get_temp_color(info['gpu_temp'])
 
@@ -380,7 +773,82 @@ def render_monitor_display(info, fonts):
     draw_rounded_rect(draw, [12, 135, 308, 230], radius=8, outline=(40, 40, 50), width=2)
 
     # GPU Label (BOLD) with icon and temperature
-    draw.text((20, 145), "▣ GPU", fill=(110, 110, 130), font=fonts['normal_bold'])
+    gpu_temp = info['gpu_temp']
+    gpu_temp_text = f"{gpu_temp:.0f}°" if gpu_temp is not None else "N/A"
+    gpu_temp_bbox = draw.textbbox((0, 0), gpu_temp_text, font=fonts['medium'])
+    gpu_temp_w = gpu_temp_bbox[2] - gpu_temp_bbox[0]
+    gpu_temp_x = WIDTH - 20 - gpu_temp_w
+    gpu_temp_y = 145
+    max_gpu_model_width = gpu_temp_x - 20 - 10
+    # 简化的后缀处理逻辑
+    gpu_model_text = gpu_info['model'] if gpu_info['model'] != 'Unknown' else "GPU"
+    gpu_brand_color = get_brand_color(gpu_info['brand'])
+
+    # 尝试识别后缀（Ti, Super, XTX等），但保留完整名称
+    original_model = gpu_model_text
+    suffix = ""
+
+    # 检查是否有后缀
+    for suffix_candidate in ['Ti', 'Super', 'XTX', 'XT', 'GRE']:
+        if suffix_candidate in original_model:
+            # 找到后缀的位置
+            suffix_pos = original_model.find(suffix_candidate)
+            # 分离基础型号和后缀
+            base_model = original_model[:suffix_pos].strip()
+            suffix = original_model[suffix_pos:].strip()
+            break
+    else:
+        # 没有找到特殊后缀，使用完整模型名作为基础型号
+        base_model = original_model
+
+    # 检查基础型号宽度...
+    gpu_icon_text = "▣ "
+    test_bbox = draw.textbbox((0, 0), gpu_icon_text + base_model, font=fonts['normal'])
+    test_w = test_bbox[2] - test_bbox[0]
+
+    if test_w > max_gpu_model_width:
+        # 截断基础型号
+        while len(base_model) > 3:
+            base_model = base_model[:-1]
+            test_text = gpu_icon_text + base_model + "..."
+            test_bbox = draw.textbbox((0, 0), test_text, font=fonts['normal'])
+            if test_bbox[2] - test_bbox[0] <= max_gpu_model_width:
+                base_model = base_model + "..."
+                break
+    
+    # 绘制 GPU 图标和基础型号
+    icon_x = 20
+    icon_y = 145
+    draw.text((20, 145), gpu_icon_text, fill=gpu_brand_color, font=fonts['normal'])
+    
+    icon_bbox = draw.textbbox((0, 0), gpu_icon_text, font=fonts['normal'])
+    icon_w = icon_bbox[2] - icon_bbox[0]
+    base_x = icon_x + icon_w
+    base_y = icon_y
+    draw.text((20 + icon_w, 145), base_model, fill=gpu_brand_color, font=fonts['normal'])
+    
+    # 绘制后缀（小字）- 放在右下角
+    if suffix:
+        # 计算基础型号的实际宽度
+        base_bbox = draw.textbbox((0, 0), base_model, font=fonts['normal'])
+        base_w = base_bbox[2] - base_bbox[0]
+        
+        # 后缀放在基础型号的右侧
+        suffix_x = base_x + base_w + 2  # 基础型号右侧，留2px间隙
+        suffix_y = base_y + 6  # 稍微向下偏移，与基础型号对齐
+        
+        # 检查后缀是否会超出温度文本的左边界
+        suffix_bbox = draw.textbbox((0, 0), suffix, font=fonts['small'])
+        suffix_w = suffix_bbox[2] - suffix_bbox[0]
+        
+        if suffix_x + suffix_w < gpu_temp_x - 5:  # 确保不覆盖温度
+            suffix_color = tuple(max(0, c - 50) for c in gpu_brand_color)
+            draw.text((suffix_x, suffix_y), suffix, fill=suffix_color, font=fonts['small'])
+        else:
+            # 如果空间不够，尝试换行显示
+            suffix_y_new = base_y + 26  # 换到下一行
+            if suffix_y_new < 175:  # 确保不超出GPU区域
+                draw.text((base_x, suffix_y_new), suffix, fill=gpu_brand_color, font=fonts['small'])
 
     gpu_temp_text = f"{info['gpu_temp']:.0f}°"
     bbox = draw.textbbox((0, 0), gpu_temp_text, font=fonts['medium'])

@@ -5,7 +5,7 @@ Wants=lm_sensors.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/deepcool-lm monitor --interval 2
+ExecStart=/usr/bin/deepcool-lm monitor --interval 2
 Restart=always
 RestartSec=10
 StandardOutput=journal

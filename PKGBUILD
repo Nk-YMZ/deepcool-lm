@@ -12,6 +12,8 @@ depends=(
     'python-psutil'
     'python-pillow'
     'lm_sensors'
+    'ttf-dejavu'
+    'pciutils'
 )
 backup=('etc/systemd/system/deepcool-lm.service')
 install=deepcool-lm.install
@@ -24,7 +26,7 @@ sha256sums=('SKIP'
 
 package() {
     # Install the CLI tool
-    install -Dm755 "${srcdir}/deepcool-lm" "${pkgdir}/usr/local/bin/deepcool-lm"
+    install -Dm755 "${srcdir}/deepcool-lm" "${pkgdir}/usr/bin/deepcool-lm"
 
     # Install systemd service
     install -Dm644 "${srcdir}/deepcool-lm.service" "${pkgdir}/etc/systemd/system/deepcool-lm.service"
