@@ -2,7 +2,7 @@
 
 这是一个通过逆向 Windows 软件的 USB 协议实现的 Linux 驱动，用于在 Deepcool LM 系列水冷屏幕上显示系统监控画面。目前已在 LM240 和 LM360 上验证，设备 VID:PID 为 `3633:0026`，屏幕分辨率为 320x240。
 
-![屏幕预览](lm240-new.jpg)
+![屏幕预览](preview.png)
 
 ## 功能
 
