@@ -11,13 +11,23 @@ HEIGHT = 240
 FRAMEBUFFER_SIZE = WIDTH * HEIGHT * 2
 
 _REGULAR_FONT_PATHS = (
+    "/usr/share/fonts/TTF/DejaVuSansCondensed.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 )
 _BOLD_FONT_PATHS = (
+    "/usr/share/fonts/TTF/DejaVuSansCondensed-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
     "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 )
+
+INK = (8, 10, 11)
+PAPER = (244, 246, 246)
+SIGNAL = (24, 209, 255)
+MUTED = (92, 101, 105)
+RULE = (199, 205, 207)
 
 
 def load_fonts():
@@ -25,87 +35,96 @@ def load_fonts():
     bold = _find_font(_BOLD_FONT_PATHS)
     if regular and bold:
         return {
-            "large": ImageFont.truetype(bold, 40),
-            "normal": ImageFont.truetype(regular, 26),
-            "small": ImageFont.truetype(regular, 20),
+            "temperature": ImageFont.truetype(bold, 44),
+            "model": ImageFont.truetype(bold, 24),
+            "data": ImageFont.truetype(bold, 16),
+            "label": ImageFont.truetype(regular, 11),
+            "micro": ImageFont.truetype(bold, 10),
         }
 
     default = ImageFont.load_default()
-    return {"large": default, "normal": default, "small": default}
+    return {
+        key: default
+        for key in ("temperature", "model", "data", "label", "micro")
+    }
 
 
 def render_monitor_image(snapshot, fonts=None):
     """根据完整系统快照生成固定 320x240 RGB 图像。"""
     fonts = fonts or load_fonts()
-    image = Image.new("RGB", (WIDTH, HEIGHT), (14, 14, 18))
+    image = Image.new("RGB", (WIDTH, HEIGHT), PAPER)
     draw = ImageDraw.Draw(image)
 
-    cpu_brand_color = get_brand_color(snapshot.cpu_brand)
-    cpu_temp_color = get_temp_color(snapshot.cpu_temp)
-    usage_color = get_usage_color(snapshot.cpu_percent)
-    frequency_color = get_frequency_color(snapshot.cpu_freq)
-    gpu_brand_color = get_brand_color(snapshot.gpu_brand)
-    gpu_temp_color = get_temp_color(snapshot.gpu_temp)
+    draw.rectangle((0, 0, WIDTH - 1, 27), fill=INK)
+    draw.rectangle((0, 0, 3, 27), fill=SIGNAL)
+    draw.text((16, 8), "SYSTEM / MONITOR", fill=PAPER, font=fonts["micro"])
+    draw.rectangle((264, 11, 269, 16), fill=SIGNAL)
+    draw.text((276, 8), "LIVE", fill=PAPER, font=fonts["micro"])
 
-    draw.rounded_rectangle(
-        (12, 10, 308, 125), radius=8, outline=(40, 40, 50), width=2
-    )
+    draw.text((16, 39), "01 / CPU", fill=MUTED, font=fonts["micro"])
     cpu_model = _format_cpu_model(snapshot.cpu_model)
-    cpu_label = _fit_text(draw, f"⚙ {cpu_model}", fonts["normal"], 200, ellipsis=False)
-    draw.text((20, 22), cpu_label, fill=cpu_brand_color, font=fonts["normal"])
+    cpu_temp = _format_temperature(snapshot.cpu_temp)
+    cpu_temp_width = _text_width(draw, cpu_temp, fonts["temperature"])
+    cpu_temp_x = WIDTH - 16 - cpu_temp_width
+    cpu_font = _fit_font(
+        draw, cpu_model, fonts["model"], cpu_temp_x - 28, minimum_size=15
+    )
+    draw.text((16, 57), cpu_model, fill=INK, font=cpu_font)
     _draw_right_text(
         draw,
-        _format_temperature(snapshot.cpu_temp),
-        300,
-        20,
-        cpu_temp_color,
-        fonts["large"],
+        cpu_temp,
+        WIDTH - 16,
+        42,
+        INK,
+        fonts["temperature"],
     )
 
-    usage_label = "Usage:"
-    draw.text((20, 68), usage_label, fill=_dim(cpu_brand_color, 30), font=fonts["small"])
-    usage_x = 20 + _text_width(draw, usage_label, fonts["small"]) + 6
-    usage_text = _format_percent(snapshot.cpu_percent)
-    draw.text((usage_x, 68), usage_text, fill=usage_color, font=fonts["small"])
-    separator_x = usage_x + _text_width(draw, usage_text, fonts["small"]) + 6
-    draw.text((separator_x, 68), "•", fill=(130, 130, 150), font=fonts["small"])
-    frequency_x = separator_x + _text_width(draw, "•", fonts["small"]) + 6
+    draw.text((16, 101), "LOAD", fill=MUTED, font=fonts["micro"])
     draw.text(
-        (frequency_x, 68),
+        (51, 96),
+        _format_percent(snapshot.cpu_percent),
+        fill=INK,
+        font=fonts["data"],
+    )
+    draw.line((91, 96, 91, 114), fill=RULE)
+    draw.text((104, 101), "CLOCK", fill=MUTED, font=fonts["micro"])
+    draw.text(
+        (151, 96),
         _format_frequency(snapshot.cpu_freq),
-        fill=frequency_color,
-        font=fonts["small"],
+        fill=INK,
+        font=fonts["data"],
     )
-    _draw_progress_bar(draw, 23, 93, 274, 18, snapshot.cpu_temp, cpu_temp_color)
+    draw.line((16, 127, WIDTH - 16, 127), fill=RULE)
+    draw.line((16, 127, 58, 127), fill=SIGNAL, width=2)
 
-    draw.rounded_rectangle(
-        (12, 135, 308, 230), radius=8, outline=(40, 40, 50), width=2
-    )
+    draw.text((16, 141), "02 / GPU", fill=MUTED, font=fonts["micro"])
     gpu_temp_text = _format_temperature(snapshot.gpu_temp)
-    gpu_temp_width = _text_width(draw, gpu_temp_text, fonts["large"])
-    gpu_model_width = max(40, WIDTH - 40 - gpu_temp_width - 12)
+    gpu_temp_width = _text_width(draw, gpu_temp_text, fonts["temperature"])
+    gpu_temp_x = WIDTH - 16 - gpu_temp_width
+    gpu_model_width = gpu_temp_x - 28
     gpu_model, gpu_suffix = _split_gpu_model(snapshot.gpu_model)
-    gpu_label = _fit_text(
-        draw, f"▣ {gpu_model}", fonts["normal"], gpu_model_width, ellipsis=False
+    gpu_model_font = _fit_font(
+        draw, gpu_model, fonts["model"], gpu_model_width, minimum_size=15
     )
-    draw.text((20, 145), gpu_label, fill=gpu_brand_color, font=fonts["normal"])
+    draw.text((16, 159), gpu_model, fill=INK, font=gpu_model_font)
     if gpu_suffix:
-        icon_width = _text_width(draw, "▣ ", fonts["normal"])
+        suffix_font = _fit_font(
+            draw, gpu_suffix, fonts["data"], gpu_model_width, minimum_size=11
+        )
         draw.text(
-            (20 + icon_width, 171),
+            (16, 188),
             gpu_suffix,
-            fill=gpu_brand_color,
-            font=fonts["small"],
+            fill=MUTED,
+            font=suffix_font,
         )
     _draw_right_text(
         draw,
         gpu_temp_text,
-        300,
-        145,
-        gpu_temp_color,
-        fonts["large"],
+        WIDTH - 16,
+        151,
+        INK,
+        fonts["temperature"],
     )
-    _draw_progress_bar(draw, 23, 200, 274, 18, snapshot.gpu_temp, gpu_temp_color)
 
     return image
 
@@ -157,64 +176,19 @@ def framebuffer_to_rgb_image(framebuffer):
     return Image.frombytes("RGB", (WIDTH, HEIGHT), bytes(pixels))
 
 
-def get_brand_color(brand):
-    return {
-        "AMD": (255, 50, 50),
-        "Intel": (100, 150, 255),
-        "NVIDIA": (100, 255, 100),
-    }.get(brand, (150, 150, 150))
-
-
-def get_temp_color(value):
-    if value is None:
-        return (130, 130, 150)
-    if value < 40:
-        return (100, 200, 255)
-    if value < 60:
-        return (100, 255, 100)
-    if value < 75:
-        return (255, 220, 50)
-    if value < 85:
-        return (255, 140, 0)
-    return (255, 50, 50)
-
-
-def get_usage_color(value):
-    if value is None:
-        return (130, 130, 150)
-    if value < 30:
-        return (100, 200, 255)
-    if value < 60:
-        return (100, 255, 100)
-    if value < 85:
-        return (255, 220, 50)
-    return (255, 50, 50)
-
-
-def get_frequency_color(value):
-    if value is None:
-        return (130, 130, 150)
-    if value < 3.5:
-        return (100, 200, 255)
-    if value < 4.5:
-        return (100, 255, 100)
-    if value < 5.2:
-        return (255, 220, 50)
-    return (255, 50, 50)
-
-
 def _find_font(paths):
     return next((path for path in paths if Path(path).is_file()), None)
 
 
-def _fit_text(draw, text, font, max_width, ellipsis=True):
-    if _text_width(draw, text, font) <= max_width:
-        return text
-    shortened = text
-    suffix = "..." if ellipsis else ""
-    while shortened and _text_width(draw, f"{shortened}{suffix}", font) > max_width:
-        shortened = shortened[:-1]
-    return f"{shortened.rstrip()}{suffix}" if shortened else suffix
+def _fit_font(draw, text, font, max_width, minimum_size):
+    """缩小字体以保留完整型号，不通过截断换取空间。"""
+    if _text_width(draw, text, font) <= max_width or not hasattr(font, "font_variant"):
+        return font
+    for size in range(font.size - 1, minimum_size - 1, -1):
+        candidate = font.font_variant(size=size)
+        if _text_width(draw, text, candidate) <= max_width:
+            return candidate
+    return font.font_variant(size=minimum_size)
 
 
 def _format_cpu_model(model):
@@ -242,20 +216,6 @@ def _draw_right_text(draw, text, right, y, color, font):
     draw.text((right - _text_width(draw, text, font), y), text, fill=color, font=font)
 
 
-def _draw_progress_bar(draw, x, y, width, height, value, color):
-    radius = height // 2
-    draw.rounded_rectangle(
-        (x, y, x + width, y + height), radius=radius, fill=(30, 30, 38)
-    )
-    if value is None:
-        return
-    fill_width = int(width * min(max(value, 0.0), 100.0) / 100.0)
-    if fill_width >= radius * 2:
-        draw.rounded_rectangle(
-            (x, y, x + fill_width, y + height), radius=radius, fill=color
-        )
-
-
 def _format_temperature(value):
     return "N/A" if value is None else f"{value:.0f}°"
 
@@ -266,7 +226,3 @@ def _format_percent(value):
 
 def _format_frequency(value):
     return "N/A" if value is None else f"{value:.2f} GHz"
-
-
-def _dim(color, amount):
-    return tuple(max(0, channel - amount) for channel in color)

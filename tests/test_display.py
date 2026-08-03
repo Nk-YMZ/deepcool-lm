@@ -4,6 +4,9 @@ from PIL import Image
 
 from deepcool_lm_display import (
     FRAMEBUFFER_SIZE,
+    INK,
+    PAPER,
+    SIGNAL,
     _format_cpu_model,
     _split_gpu_model,
     framebuffer_to_rgb_image,
@@ -31,6 +34,13 @@ class DisplayTests(unittest.TestCase):
 
         self.assertEqual(image.mode, "RGB")
         self.assertEqual(image.size, (320, 240))
+
+    def test_minimal_ark_palette_uses_light_paper_and_one_signal_color(self):
+        image = render_monitor_image(SystemSnapshot())
+
+        self.assertEqual(image.getpixel((319, 239)), PAPER)
+        self.assertEqual(image.getpixel((240, 10)), INK)
+        self.assertEqual(image.getpixel((1, 10)), SIGNAL)
 
     def test_missing_metrics_can_be_rendered(self):
         image = render_monitor_image(SystemSnapshot())
