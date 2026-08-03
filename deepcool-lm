@@ -20,6 +20,8 @@ import usb.util
 
 from deepcool_lm_display import (
     FRAMEBUFFER_SIZE,
+    THEME_LIGHT,
+    THEME_NAMES,
     load_fonts,
     render_monitor_framebuffer,
     render_solid_image,
@@ -46,6 +48,7 @@ class DisplayState:
     def __init__(self):
         self._mode = "monitor"
         self._framebuffer = None
+        self._theme = THEME_LIGHT
         self._lock = threading.Lock()
 
     def set_monitor(self):
@@ -58,9 +61,15 @@ class DisplayState:
             self._mode = "solid"
             self._framebuffer = framebuffer
 
+    def set_theme(self, theme):
+        if theme not in THEME_NAMES:
+            raise ValueError(f"未知主题: {theme}")
+        with self._lock:
+            self._theme = theme
+
     def get(self):
         with self._lock:
-            return self._mode, self._framebuffer
+            return self._mode, self._framebuffer, self._theme
 
 
 class IPCServer:
@@ -108,6 +117,8 @@ class IPCServer:
                 color = _validate_color(request.get("color"))
                 framebuffer = rgb_to_framebuffer(render_solid_image(color))
                 self.display_state.set_solid(framebuffer)
+            elif action == "theme":
+                self.display_state.set_theme(request.get("theme"))
             else:
                 raise ValueError(f"未知操作: {action}")
             response = {"status": "ok"}
@@ -224,10 +235,10 @@ def run_monitor(device, interval):
 
     try:
         while True:
-            mode, framebuffer = display_state.get()
+            mode, framebuffer, theme = display_state.get()
             if mode == "monitor":
                 snapshot = monitor.sample()
-                framebuffer = render_monitor_framebuffer(snapshot, fonts)
+                framebuffer = render_monitor_framebuffer(snapshot, fonts, theme)
                 status = _format_status(snapshot)
             else:
                 status = "显示纯色画面"
@@ -283,6 +294,9 @@ def main():
     brightness_parser = commands.add_parser("brightness", help="调节亮度")
     brightness_parser.add_argument("direction", choices=("up", "down"))
 
+    theme_parser = commands.add_parser("theme", help="动态切换监控画面主题")
+    theme_parser.add_argument("name", choices=THEME_NAMES)
+
     args = parser.parse_args()
     try:
         if args.command == "monitor":
@@ -309,6 +323,12 @@ def main():
             finally:
                 device.disconnect()
             print(f"已显示纯色画面: {color}")
+            return
+
+        if args.command == "theme":
+            if not execute_remote({"action": "theme", "theme": args.name}):
+                raise RuntimeError("监控服务未运行，无法动态切换主题")
+            print(f"已切换到 {args.name} 主题")
             return
 
         action = "brightness_up" if args.direction == "up" else "brightness_down"

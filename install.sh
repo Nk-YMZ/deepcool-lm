@@ -65,5 +65,6 @@ fi
 
 echo "安装完成。"
 echo "监控: sudo deepcool-lm monitor"
+echo "主题: sudo deepcool-lm theme dark"
 echo "纯色: sudo deepcool-lm solid --color 255 0 0"
 echo "亮度: sudo deepcool-lm brightness up"

@@ -8,7 +8,7 @@
 
 - 显示 CPU/GPU 型号、温度、CPU 使用率和频率
 - 支持 AMD、Intel 和 NVIDIA 的常见传感器来源
-- 支持纯色画面和亮度调节
+- 支持浅色/深色监控主题动态切换、纯色画面和亮度调节
 - 通过 systemd 持续运行
 - CLI 通过 Unix socket 控制已运行的服务，避免重复占用 USB
 - 提供不访问 USB 的 320x240 桌面调试预览器
@@ -73,6 +73,15 @@ sudo systemctl enable --now lm_sensors
 sudo deepcool-lm monitor
 sudo deepcool-lm monitor --interval 1
 ```
+
+动态切换监控主题：
+
+```bash
+sudo deepcool-lm theme light
+sudo deepcool-lm theme dark
+```
+
+主题由运行中的监控服务保存，切换后下一帧立即生效，不会重启服务或重新占用 USB。服务重启后默认恢复浅色主题。
 
 显示纯色：
 

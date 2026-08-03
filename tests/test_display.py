@@ -3,10 +3,16 @@ import unittest
 from PIL import Image
 
 from deepcool_lm_display import (
+    DARK_INK,
+    DARK_PAPER,
+    DARK_RULE,
+    DARK_SIGNAL,
     FRAMEBUFFER_SIZE,
     INK,
     PAPER,
+    RULE,
     SIGNAL,
+    THEME_DARK,
     _format_cpu_model,
     _split_gpu_model,
     framebuffer_to_rgb_image,
@@ -41,6 +47,25 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual(image.getpixel((319, 239)), PAPER)
         self.assertEqual(image.getpixel((240, 10)), INK)
         self.assertEqual(image.getpixel((1, 10)), SIGNAL)
+
+    def test_dark_theme_inverts_surface_and_text_without_changing_signal(self):
+        image = render_monitor_image(SystemSnapshot(), theme=THEME_DARK)
+
+        self.assertEqual(image.getpixel((319, 239)), DARK_PAPER)
+        self.assertEqual(image.getpixel((240, 10)), DARK_INK)
+        self.assertEqual(image.getpixel((1, 10)), DARK_SIGNAL)
+
+    def test_section_divider_is_a_uniform_rule_in_both_themes(self):
+        light = render_monitor_image(SystemSnapshot())
+        dark = render_monitor_image(SystemSnapshot(), theme=THEME_DARK)
+
+        for x in (16, 58, 160, 304):
+            self.assertEqual(light.getpixel((x, 127)), RULE)
+            self.assertEqual(dark.getpixel((x, 127)), DARK_RULE)
+
+    def test_unknown_theme_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "未知主题"):
+            render_monitor_image(SystemSnapshot(), theme="unknown")
 
     def test_missing_metrics_can_be_rendered(self):
         image = render_monitor_image(SystemSnapshot())

@@ -78,6 +78,34 @@ class DriverTests(unittest.TestCase):
         server = self.driver.IPCServer(FakeUSBDevice(), self.driver.DisplayState())
         server._handle(server_connection)
 
+    def test_theme_ipc_action_updates_running_display_state(self):
+        server_connection, client_connection = socket.socketpair()
+        client_connection.sendall(b'{"action":"theme","theme":"dark"}')
+        client_connection.shutdown(socket.SHUT_WR)
+        display_state = self.driver.DisplayState()
+
+        server = self.driver.IPCServer(FakeUSBDevice(), display_state)
+        server._handle(server_connection)
+        response = client_connection.recv(4096)
+        client_connection.close()
+
+        self.assertIn(b'"status": "ok"', response)
+        self.assertEqual(display_state.get(), ("monitor", None, "dark"))
+
+    def test_unknown_theme_ipc_action_is_rejected(self):
+        server_connection, client_connection = socket.socketpair()
+        client_connection.sendall(b'{"action":"theme","theme":"unknown"}')
+        client_connection.shutdown(socket.SHUT_WR)
+        display_state = self.driver.DisplayState()
+
+        server = self.driver.IPCServer(FakeUSBDevice(), display_state)
+        server._handle(server_connection)
+        response = client_connection.recv(4096)
+        client_connection.close()
+
+        self.assertIn(b'"status": "error"', response)
+        self.assertEqual(display_state.get(), ("monitor", None, "light"))
+
 
 if __name__ == "__main__":
     unittest.main()

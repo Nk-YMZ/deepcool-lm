@@ -29,6 +29,20 @@ SIGNAL = (24, 209, 255)
 MUTED = (92, 101, 105)
 RULE = (199, 205, 207)
 
+DARK_INK = (244, 246, 246)
+DARK_PAPER = (8, 10, 11)
+DARK_SIGNAL = (24, 209, 255)
+DARK_MUTED = (154, 163, 166)
+DARK_RULE = (53, 61, 64)
+
+THEME_LIGHT = "light"
+THEME_DARK = "dark"
+THEME_NAMES = (THEME_LIGHT, THEME_DARK)
+_THEME_PALETTES = {
+    THEME_LIGHT: (INK, PAPER, SIGNAL, MUTED, RULE),
+    THEME_DARK: (DARK_INK, DARK_PAPER, DARK_SIGNAL, DARK_MUTED, DARK_RULE),
+}
+
 
 def load_fonts():
     regular = _find_font(_REGULAR_FONT_PATHS)
@@ -49,19 +63,24 @@ def load_fonts():
     }
 
 
-def render_monitor_image(snapshot, fonts=None):
+def render_monitor_image(snapshot, fonts=None, theme=THEME_LIGHT):
     """根据完整系统快照生成固定 320x240 RGB 图像。"""
     fonts = fonts or load_fonts()
-    image = Image.new("RGB", (WIDTH, HEIGHT), PAPER)
+    try:
+        ink, paper, signal, muted, rule = _THEME_PALETTES[theme]
+    except KeyError as error:
+        raise ValueError(f"未知主题: {theme}") from error
+
+    image = Image.new("RGB", (WIDTH, HEIGHT), paper)
     draw = ImageDraw.Draw(image)
 
-    draw.rectangle((0, 0, WIDTH - 1, 27), fill=INK)
-    draw.rectangle((0, 0, 3, 27), fill=SIGNAL)
-    draw.text((16, 8), "SYSTEM / MONITOR", fill=PAPER, font=fonts["micro"])
-    draw.rectangle((264, 11, 269, 16), fill=SIGNAL)
-    draw.text((276, 8), "LIVE", fill=PAPER, font=fonts["micro"])
+    draw.rectangle((0, 0, WIDTH - 1, 27), fill=ink)
+    draw.rectangle((0, 0, 3, 27), fill=signal)
+    draw.text((16, 8), "SYSTEM / MONITOR", fill=paper, font=fonts["micro"])
+    draw.rectangle((264, 11, 269, 16), fill=signal)
+    draw.text((276, 8), "LIVE", fill=paper, font=fonts["micro"])
 
-    draw.text((16, 39), "01 / CPU", fill=MUTED, font=fonts["micro"])
+    draw.text((16, 39), "01 / CPU", fill=muted, font=fonts["micro"])
     cpu_model = _format_cpu_model(snapshot.cpu_model)
     cpu_temp = _format_temperature(snapshot.cpu_temp)
     cpu_temp_width = _text_width(draw, cpu_temp, fonts["temperature"])
@@ -69,35 +88,34 @@ def render_monitor_image(snapshot, fonts=None):
     cpu_font = _fit_font(
         draw, cpu_model, fonts["model"], cpu_temp_x - 28, minimum_size=15
     )
-    draw.text((16, 57), cpu_model, fill=INK, font=cpu_font)
+    draw.text((16, 57), cpu_model, fill=ink, font=cpu_font)
     _draw_right_text(
         draw,
         cpu_temp,
         WIDTH - 16,
         42,
-        INK,
+        ink,
         fonts["temperature"],
     )
 
-    draw.text((16, 101), "LOAD", fill=MUTED, font=fonts["micro"])
+    draw.text((16, 101), "LOAD", fill=muted, font=fonts["micro"])
     draw.text(
         (51, 96),
         _format_percent(snapshot.cpu_percent),
-        fill=INK,
+        fill=ink,
         font=fonts["data"],
     )
-    draw.line((91, 96, 91, 114), fill=RULE)
-    draw.text((104, 101), "CLOCK", fill=MUTED, font=fonts["micro"])
+    draw.line((91, 96, 91, 114), fill=rule)
+    draw.text((104, 101), "CLOCK", fill=muted, font=fonts["micro"])
     draw.text(
         (151, 96),
         _format_frequency(snapshot.cpu_freq),
-        fill=INK,
+        fill=ink,
         font=fonts["data"],
     )
-    draw.line((16, 127, WIDTH - 16, 127), fill=RULE)
-    draw.line((16, 127, 58, 127), fill=SIGNAL, width=2)
+    draw.line((16, 127, WIDTH - 16, 127), fill=rule)
 
-    draw.text((16, 141), "02 / GPU", fill=MUTED, font=fonts["micro"])
+    draw.text((16, 141), "02 / GPU", fill=muted, font=fonts["micro"])
     gpu_temp_text = _format_temperature(snapshot.gpu_temp)
     gpu_temp_width = _text_width(draw, gpu_temp_text, fonts["temperature"])
     gpu_temp_x = WIDTH - 16 - gpu_temp_width
@@ -106,7 +124,7 @@ def render_monitor_image(snapshot, fonts=None):
     gpu_model_font = _fit_font(
         draw, gpu_model, fonts["model"], gpu_model_width, minimum_size=15
     )
-    draw.text((16, 159), gpu_model, fill=INK, font=gpu_model_font)
+    draw.text((16, 159), gpu_model, fill=ink, font=gpu_model_font)
     if gpu_suffix:
         suffix_font = _fit_font(
             draw, gpu_suffix, fonts["data"], gpu_model_width, minimum_size=11
@@ -114,7 +132,7 @@ def render_monitor_image(snapshot, fonts=None):
         draw.text(
             (16, 188),
             gpu_suffix,
-            fill=MUTED,
+            fill=muted,
             font=suffix_font,
         )
     _draw_right_text(
@@ -122,16 +140,16 @@ def render_monitor_image(snapshot, fonts=None):
         gpu_temp_text,
         WIDTH - 16,
         151,
-        INK,
+        ink,
         fonts["temperature"],
     )
 
     return image
 
 
-def render_monitor_framebuffer(snapshot, fonts=None):
+def render_monitor_framebuffer(snapshot, fonts=None, theme=THEME_LIGHT):
     """生成正式 USB 传输使用的最终 RGB565 framebuffer。"""
-    return rgb_to_framebuffer(render_monitor_image(snapshot, fonts))
+    return rgb_to_framebuffer(render_monitor_image(snapshot, fonts, theme))
 
 
 def render_solid_image(color):
