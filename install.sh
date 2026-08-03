@@ -6,7 +6,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-REPO_URL="https://raw.githubusercontent.com/daedlock/deepcool-lm/main"
+REPO_URL="https://raw.githubusercontent.com/Nk-YMZ/deepcool-lm/main"
 TEMP_DIR=$(mktemp -d)
 SOURCE_DIR="$TEMP_DIR/source"
 FILES=(deepcool-lm deepcool_lm_display.py deepcool_lm_system.py deepcool-lm.service)

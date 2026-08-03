@@ -10,7 +10,7 @@
 
 ## Installation Boundaries
 
-- Arch packaging is defined by `PKGBUILD`: it installs the executable to `/usr/bin`, shared modules to `/usr/lib/deepcool-lm`, and the service to `/etc/systemd/system`. `deepcool-lm.install` contains package lifecycle hooks.
+- Arch packaging is defined by `PKGBUILD`: it installs the executable to `/usr/bin`, shared modules to `/usr/lib/deepcool-lm`, and the service to `/etc/systemd/system`. `deepcool-lm.install` contains package lifecycle hooks. The AUR publishes this as `deepcool-lm-arkui` with `provides=('deepcool-lm')` and `conflicts=('deepcool-lm')`; the in-repo `PKGBUILD` keeps `pkgname=deepcool-lm`.
 - `install.sh` is a separate, interactive root installer. It installs under `/usr/local`, downloads missing source files from the repository's `main` branch, rewrites the service executable path, and manages systemd itself.
 - The service explicitly starts `/usr/bin/deepcool-lm`; account for that path when changing either installation flow.
 - The service waits 12 seconds before opening USB via `ExecStartPre=/usr/bin/sleep 12`, after clearing the stale socket. This delay avoids racing udev/kernel settling at boot; keep both `ExecStartPre` lines when editing the unit.

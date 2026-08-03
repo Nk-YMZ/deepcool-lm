@@ -3,7 +3,7 @@ pkgver=1.3.0
 pkgrel=1
 pkgdesc="Linux driver for Deepcool LM series AIO coolers with LCD display (tested on LM360)"
 arch=('any')
-url="https://github.com/daedlock/deepcool-lm"
+url="https://github.com/Nk-YMZ/deepcool-lm"
 license=('MIT')
 depends=(
     'python'
