@@ -10,6 +10,8 @@ Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+StateDirectory=deepcool-lm
+StateDirectoryMode=0755
 
 # Run as root (required for USB access)
 User=root

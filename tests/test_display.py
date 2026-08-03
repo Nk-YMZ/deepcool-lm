@@ -1,6 +1,6 @@
 import unittest
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from deepcool_lm_display import (
     DARK_INK,
@@ -13,9 +13,15 @@ from deepcool_lm_display import (
     RULE,
     SIGNAL,
     THEME_DARK,
+    _fit_text,
     _format_cpu_model,
+    _format_frequency,
+    _format_percent,
+    _format_temperature,
     _split_gpu_model,
+    _text_width,
     framebuffer_to_rgb_image,
+    load_fonts,
     render_monitor_image,
     render_monitor_framebuffer,
     rgb_to_framebuffer,
@@ -93,9 +99,50 @@ class DisplayTests(unittest.TestCase):
     def test_hardware_models_use_compact_layout_without_ellipsis(self):
         self.assertEqual(_format_cpu_model("Ryzen 9 9900X"), "R9 9900X")
         self.assertEqual(
+            _format_cpu_model("AMD Ryzen Threadripper PRO 7995WX 96-Cores"),
+            "TR PRO 7995WX",
+        )
+        self.assertEqual(
+            _format_cpu_model("AMD Ryzen 7 PRO 8840U w/ Radeon 780M Graphics"),
+            "R7 PRO 8840U",
+        )
+        self.assertEqual(
+            _format_cpu_model("13th Gen Intel(R) Core(TM) i9-13900K"),
+            "i9-13900K",
+        )
+        self.assertEqual(
             _split_gpu_model("RTX 4070 Ti SUPER"),
             ("RTX 4070", "Ti SUPER"),
         )
+        self.assertEqual(
+            _split_gpu_model("RTX PRO 6000 Blackwell Workstation Edition"),
+            ("RTX PRO 6000", "Blackwell"),
+        )
+
+    def test_extreme_model_is_clipped_to_the_available_pixel_width(self):
+        font = load_fonts()["model"]
+        draw = ImageDraw.Draw(Image.new("RGB", (320, 240)))
+
+        text, fitted_font = _fit_text(
+            draw,
+            "RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+            font,
+            190,
+            minimum_size=15,
+        )
+
+        self.assertLessEqual(_text_width(draw, text, fitted_font), 190)
+        self.assertTrue(text.endswith("..."))
+
+    def test_invalid_metrics_are_rendered_as_unavailable(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                self.assertEqual(_format_temperature(value), "N/A")
+                self.assertEqual(_format_percent(value), "N/A")
+                self.assertEqual(_format_frequency(value), "N/A")
+        self.assertEqual(_format_temperature(101), "101°")
+        self.assertEqual(_format_percent(101), "N/A")
+        self.assertEqual(_format_frequency(101), "N/A")
 
     def test_preview_decodes_the_exact_usb_framebuffer(self):
         snapshot = SystemSnapshot(

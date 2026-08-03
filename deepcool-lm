@@ -34,6 +34,7 @@ VENDOR_ID = 0x3633
 PRODUCT_ID = 0x0026
 EP_OUT = 0x01
 SOCKET_PATH = "/var/run/deepcool-lm.sock"
+THEME_PATH = Path(os.environ.get("STATE_DIRECTORY", "/var/lib/deepcool-lm")) / "theme"
 
 # 这些字节来自对 Windows 驱动协议的逆向，不属于普通界面配置。
 FRAME_HEADER = bytes(
@@ -45,10 +46,11 @@ INIT_QUERY = bytes([0xAA, 0x01, 0x00, 0x09, 0x29, 0x91])
 
 
 class DisplayState:
-    def __init__(self):
+    def __init__(self, theme_path=THEME_PATH):
         self._mode = "monitor"
         self._framebuffer = None
-        self._theme = THEME_LIGHT
+        self._theme_path = Path(theme_path)
+        self._theme = _load_theme(self._theme_path)
         self._lock = threading.Lock()
 
     def set_monitor(self):
@@ -65,6 +67,7 @@ class DisplayState:
         if theme not in THEME_NAMES:
             raise ValueError(f"未知主题: {theme}")
         with self._lock:
+            _save_theme(self._theme_path, theme)
             self._theme = theme
 
     def get(self):
@@ -354,6 +357,33 @@ def _receive_all(connection, limit):
         data.extend(chunk)
         if len(data) > limit:
             raise ValueError(f"IPC 消息超过 {limit} 字节")
+
+
+def _load_theme(path):
+    try:
+        theme = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return THEME_LIGHT
+    return theme if theme in THEME_NAMES else THEME_LIGHT
+
+
+def _save_theme(path, theme):
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with temporary.open("w", encoding="utf-8") as output:
+            output.write(f"{theme}\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _validate_color(color):

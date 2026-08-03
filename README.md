@@ -81,7 +81,7 @@ sudo deepcool-lm theme light
 sudo deepcool-lm theme dark
 ```
 
-主题由运行中的监控服务保存，切换后下一帧立即生效，不会重启服务或重新占用 USB。服务重启后默认恢复浅色主题。
+主题由运行中的监控服务保存到 `/var/lib/deepcool-lm/theme`，切换后下一帧立即生效，不会重启服务或重新占用 USB。服务重启后自动恢复上次使用的主题；首次运行或状态文件无效时使用浅色主题。
 
 显示纯色：
 

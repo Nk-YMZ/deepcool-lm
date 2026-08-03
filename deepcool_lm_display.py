@@ -1,6 +1,7 @@
 """Deepcool LM 屏幕的纯 PIL 绘制和 RGB565 编码。"""
 
 from pathlib import Path
+import math
 import re
 
 from PIL import Image, ImageDraw, ImageFont
@@ -85,7 +86,7 @@ def render_monitor_image(snapshot, fonts=None, theme=THEME_LIGHT):
     cpu_temp = _format_temperature(snapshot.cpu_temp)
     cpu_temp_width = _text_width(draw, cpu_temp, fonts["temperature"])
     cpu_temp_x = WIDTH - 16 - cpu_temp_width
-    cpu_font = _fit_font(
+    cpu_model, cpu_font = _fit_text(
         draw, cpu_model, fonts["model"], cpu_temp_x - 28, minimum_size=15
     )
     draw.text((16, 57), cpu_model, fill=ink, font=cpu_font)
@@ -121,12 +122,12 @@ def render_monitor_image(snapshot, fonts=None, theme=THEME_LIGHT):
     gpu_temp_x = WIDTH - 16 - gpu_temp_width
     gpu_model_width = gpu_temp_x - 28
     gpu_model, gpu_suffix = _split_gpu_model(snapshot.gpu_model)
-    gpu_model_font = _fit_font(
+    gpu_model, gpu_model_font = _fit_text(
         draw, gpu_model, fonts["model"], gpu_model_width, minimum_size=15
     )
     draw.text((16, 159), gpu_model, fill=ink, font=gpu_model_font)
     if gpu_suffix:
-        suffix_font = _fit_font(
+        gpu_suffix, suffix_font = _fit_text(
             draw, gpu_suffix, fonts["data"], gpu_model_width, minimum_size=11
         )
         draw.text(
@@ -198,27 +199,59 @@ def _find_font(paths):
     return next((path for path in paths if Path(path).is_file()), None)
 
 
-def _fit_font(draw, text, font, max_width, minimum_size):
-    """缩小字体以保留完整型号，不通过截断换取空间。"""
-    if _text_width(draw, text, font) <= max_width or not hasattr(font, "font_variant"):
-        return font
-    for size in range(font.size - 1, minimum_size - 1, -1):
-        candidate = font.font_variant(size=size)
-        if _text_width(draw, text, candidate) <= max_width:
-            return candidate
-    return font.font_variant(size=minimum_size)
+def _fit_text(draw, text, font, max_width, minimum_size):
+    """优先缩小字体，达到最小字号后再按像素安全截断。"""
+    candidate = font
+    if hasattr(font, "font_variant"):
+        for size in range(font.size, minimum_size - 1, -1):
+            candidate = font.font_variant(size=size)
+            if _text_width(draw, text, candidate) <= max_width:
+                return text, candidate
+    elif _text_width(draw, text, font) <= max_width:
+        return text, font
+
+    marker = "..."
+    if _text_width(draw, marker, candidate) > max_width:
+        return "", candidate
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        clipped = text[:middle].rstrip() + marker
+        if _text_width(draw, clipped, candidate) <= max_width:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low].rstrip() + marker, candidate
 
 
 def _format_cpu_model(model):
-    model = (model or "Unknown").strip()
+    model = re.sub(r"\s+", " ", (model or "Unknown").strip())
+    model = re.sub(r"^\d+(?:st|nd|rd|th)\s+Gen\s+", "", model, flags=re.I)
+    model = re.sub(r"^(?:AMD|Intel(?:\(R\))?)\s+", "", model, flags=re.I)
+    model = re.sub(r"\bIntel(?:\(R\))?\s+", "", model, flags=re.I)
+    model = re.sub(r"\((?:R|TM)\)", "", model, flags=re.I)
+    model = re.sub(r"\bCPU\b\s*", "", model, flags=re.I)
+    model = re.sub(r"\s+(?:w/|with)\s+Radeon.*$", "", model, flags=re.I)
+    model = re.sub(r"\s+\d+-Cores?(?:\s+Processor)?$", "", model, flags=re.I)
+    model = re.sub(r"\s+Processor$|\s+@\s+.*$", "", model, flags=re.I)
+    model = re.sub(r"^Ryzen\s+Threadripper\s+", "TR ", model, flags=re.I)
     model = re.sub(r"^Ryzen\s+(\d)\s+", r"R\1 ", model)
     model = re.sub(r"^Core\s+", "", model)
-    return model
+    return re.sub(r"\s+", " ", model).strip() or "Unknown"
 
 
 def _split_gpu_model(model):
-    model = (model or "Unknown").strip()
-    model = re.sub(r"^(?:NVIDIA\s+)?(?:GeForce\s+)?", "", model)
+    model = re.sub(r"\s+", " ", (model or "Unknown").strip())
+    model = re.sub(r"^(?:NVIDIA\s+)?(?:GeForce\s+)?", "", model, flags=re.I)
+    model = re.sub(r"(\d)(Ti|SUPER|XTX|XT|GRE)\b", r"\1 \2", model, flags=re.I)
+    model = re.sub(r"\bTiSUPER\b", "Ti SUPER", model, flags=re.I)
+    workstation = re.match(
+        r"^(RTX(?:\s+PRO)?\s+[A-Z]?\d+)\s+(.+?)(?:\s+Workstation\s+Edition)?$",
+        model,
+        re.I,
+    )
+    if workstation:
+        return workstation.group(1), workstation.group(2)
     match = re.match(r"^(.*?\d)\s+(Ti(?:\s+SUPER)?|SUPER|XTX|XT|GRE)$", model, re.I)
     if not match:
         return model, ""
@@ -235,12 +268,21 @@ def _draw_right_text(draw, text, right, y, color, font):
 
 
 def _format_temperature(value):
-    return "N/A" if value is None else f"{value:.0f}°"
+    return "N/A" if not _valid_number(value, -100, 200) else f"{value:.0f}°"
 
 
 def _format_percent(value):
-    return "N/A" if value is None else f"{value:.0f}%"
+    return "N/A" if not _valid_number(value, 0, 100) else f"{value:.0f}%"
 
 
 def _format_frequency(value):
-    return "N/A" if value is None else f"{value:.2f} GHz"
+    return "N/A" if not _valid_number(value, 0, 100) else f"{value:.2f} GHz"
+
+
+def _valid_number(value, minimum, maximum):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and minimum <= value <= maximum
+    )

@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 from pathlib import Path
 import socket
+import tempfile
 import unittest
 
 
@@ -82,7 +83,10 @@ class DriverTests(unittest.TestCase):
         server_connection, client_connection = socket.socketpair()
         client_connection.sendall(b'{"action":"theme","theme":"dark"}')
         client_connection.shutdown(socket.SHUT_WR)
-        display_state = self.driver.DisplayState()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        theme_path = Path(temporary.name) / "theme"
+        display_state = self.driver.DisplayState(theme_path)
 
         server = self.driver.IPCServer(FakeUSBDevice(), display_state)
         server._handle(server_connection)
@@ -91,12 +95,18 @@ class DriverTests(unittest.TestCase):
 
         self.assertIn(b'"status": "ok"', response)
         self.assertEqual(display_state.get(), ("monitor", None, "dark"))
+        self.assertEqual(
+            self.driver.DisplayState(theme_path).get(),
+            ("monitor", None, "dark"),
+        )
 
     def test_unknown_theme_ipc_action_is_rejected(self):
         server_connection, client_connection = socket.socketpair()
         client_connection.sendall(b'{"action":"theme","theme":"unknown"}')
         client_connection.shutdown(socket.SHUT_WR)
-        display_state = self.driver.DisplayState()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        display_state = self.driver.DisplayState(Path(temporary.name) / "theme")
 
         server = self.driver.IPCServer(FakeUSBDevice(), display_state)
         server._handle(server_connection)
@@ -104,6 +114,15 @@ class DriverTests(unittest.TestCase):
         client_connection.close()
 
         self.assertIn(b'"status": "error"', response)
+        self.assertEqual(display_state.get(), ("monitor", None, "light"))
+
+    def test_invalid_persisted_theme_falls_back_to_light(self):
+        with tempfile.TemporaryDirectory() as directory:
+            theme_path = Path(directory) / "theme"
+            theme_path.write_text("invalid\n", encoding="utf-8")
+
+            display_state = self.driver.DisplayState(theme_path)
+
         self.assertEqual(display_state.get(), ("monitor", None, "light"))
 
 

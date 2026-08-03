@@ -1,5 +1,5 @@
 pkgname=deepcool-lm
-pkgver=1.2.0
+pkgver=1.3.0
 pkgrel=1
 pkgdesc="Linux driver for Deepcool LM series AIO coolers with LCD display (tested on LM360)"
 arch=('any')

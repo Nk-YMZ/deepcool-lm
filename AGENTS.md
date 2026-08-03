@@ -3,7 +3,7 @@
 ## Scope and Architecture
 
 - `deepcool-lm` owns USB transport, production IPC, display state, and the CLI. `deepcool_lm_system.py` collects system data without USB; `deepcool_lm_display.py` renders PIL images and encodes RGB565 without collecting data.
-- `monitor` owns the USB device and `/var/run/deepcool-lm.sock`; while that socket exists, `solid`, `brightness`, `theme`, and `monitor` send JSON to the running process instead of opening USB directly. `theme light|dark` updates runtime monitor state without reopening USB; service restarts intentionally return to the default light theme. Custom image upload is intentionally unsupported.
+- `monitor` owns the USB device and `/var/run/deepcool-lm.sock`; while that socket exists, `solid`, `brightness`, `theme`, and `monitor` send JSON to the running process instead of opening USB directly. `theme light|dark` updates runtime monitor state without reopening USB and persists it at `/var/lib/deepcool-lm/theme`; service restarts restore that theme. Custom image upload is intentionally unsupported.
 - `deepcool-lm-preview` is a repository-only PySide6 tool. It must not import PyUSB, connect to the production socket, or be installed by packaging scripts; its control socket lives under `$XDG_RUNTIME_DIR`, while timestamped PNGs go to ignored `previews/`.
 - Hardware assumptions are protocol-critical: VID:PID `3633:0026`, endpoint `0x01`, 320x240 output, a 13-byte frame header, and a 153,600-byte little-endian RGB565 framebuffer. Do not change these as ordinary UI constants.
 - `pkg/`, `src/`, and `*.pkg.tar.*` are `makepkg` outputs. Edit root sources only.
@@ -14,6 +14,7 @@
 - `install.sh` is a separate, interactive root installer. It installs under `/usr/local`, downloads missing source files from the repository's `main` branch, rewrites the service executable path, and manages systemd itself.
 - The service explicitly starts `/usr/bin/deepcool-lm`; account for that path when changing either installation flow.
 - The service waits 12 seconds before opening USB via `ExecStartPre=/usr/bin/sleep 12`, after clearing the stale socket. This delay avoids racing udev/kernel settling at boot; keep both `ExecStartPre` lines when editing the unit.
+- `StateDirectory=deepcool-lm` creates the persistent theme state directory; keep it synchronized with `THEME_PATH` in `deepcool-lm`.
 - `PKGBUILD` is authoritative package metadata. After changing it, regenerate the tracked `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`; do not hand-edit `.SRCINFO`.
 - Do not run `install.sh`, `uninstall.sh`, package install hooks, `systemctl` mutations, or device commands during routine verification: they require root and alter the host or real LCD.
 

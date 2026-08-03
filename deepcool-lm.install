@@ -42,6 +42,7 @@ post_install() {
 post_upgrade() {
     echo ""
     echo "==> Deepcool LM Series Driver upgraded"
+    systemctl daemon-reload
     echo "==> Restarting service if running..."
 
     if systemctl is-active --quiet deepcool-lm.service; then
