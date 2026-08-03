@@ -17,5 +17,8 @@ User=root
 # Clean up stale socket file before starting
 ExecStartPre=-/bin/rm -f /var/run/deepcool-lm.sock
 
+# Wait for USB device to settle after boot before opening it
+ExecStartPre=/usr/bin/sleep 12
+
 [Install]
 WantedBy=sysinit.target
