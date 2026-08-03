@@ -32,7 +32,7 @@ post_install() {
     echo ""
     echo "==> CLI usage:"
     echo "    sudo deepcool-lm monitor           # Start system monitoring"
-    echo "    sudo deepcool-lm image <file>      # Display custom image"
+    echo "    sudo deepcool-lm solid --color 0 0 0"
     echo "    sudo deepcool-lm brightness up     # Adjust brightness"
     echo "    sudo deepcool-lm --help            # Show all commands"
     echo ""

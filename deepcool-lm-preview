@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""在桌面窗口中预览 Deepcool LM 画面，不导入或访问 USB。"""
+
+import argparse
+from dataclasses import replace
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import socket
+import stat
+import sys
+import threading
+from datetime import datetime
+
+from deepcool_lm_display import (
+    HEIGHT,
+    WIDTH,
+    framebuffer_to_rgb_image,
+    load_fonts,
+    render_monitor_framebuffer,
+)
+from deepcool_lm_system import SystemMonitor
+
+
+FIELDS = {
+    "cpu_brand",
+    "cpu_model",
+    "cpu_temp",
+    "cpu_percent",
+    "cpu_freq",
+    "gpu_brand",
+    "gpu_model",
+    "gpu_temp",
+}
+NUMERIC_FIELDS = {"cpu_temp", "cpu_percent", "cpu_freq", "gpu_temp"}
+BRAND_FIELDS = {"cpu_brand", "gpu_brand"}
+MODEL_FIELDS = {"cpu_model", "gpu_model"}
+BRANDS = {"AMD", "Intel", "NVIDIA", "Unknown"}
+PRODUCTION_SOCKET = Path("/var/run/deepcool-lm.sock").resolve()
+
+
+def runtime_path(name):
+    runtime_directory = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_directory:
+        raise RuntimeError("XDG_RUNTIME_DIR 未设置，无法安全创建预览控制 socket")
+    directory = Path(runtime_directory)
+    if not directory.is_dir() or directory.stat().st_uid != os.getuid():
+        raise RuntimeError(f"运行目录无效或不属于当前用户: {directory}")
+    return directory / name
+
+
+def default_preview_path():
+    directory = Path(__file__).resolve().parent / "previews"
+    directory.mkdir(exist_ok=True)
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+    return directory / f"preview-{timestamp}.png"
+
+
+class ControlRequest:
+    def __init__(self, payload):
+        self.payload = payload
+        self.response = None
+        self.finished = threading.Event()
+
+    def complete(self, response):
+        self.response = response
+        self.finished.set()
+
+
+class ControlServer:
+    def __init__(self, path, dispatch):
+        self.path = Path(path)
+        self.dispatch = dispatch
+        self.socket = None
+        self.running = False
+        self.thread = None
+        self.lock_file = None
+
+    def start(self):
+        self.path.parent.mkdir(parents=False, exist_ok=True)
+        self.lock_file = _acquire_lock(self.path.with_name(f"{self.path.name}.lock"))
+        if self.path.exists():
+            status = self.path.lstat()
+            if status.st_uid != os.getuid() or not stat.S_ISSOCK(status.st_mode):
+                raise RuntimeError(f"拒绝删除非当前用户 socket: {self.path}")
+            self.path.unlink()
+
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.bind(str(self.path))
+        os.chmod(self.path, 0o600)
+        self.socket.listen(8)
+        self.running = True
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        while self.running:
+            try:
+                connection, _ = self.socket.accept()
+            except OSError:
+                break
+            with connection:
+                connection.settimeout(15)
+                try:
+                    payload = json.loads(_receive_all(connection).decode("utf-8"))
+                    request = ControlRequest(payload)
+                    self.dispatch(request)
+                    if not request.finished.wait(15):
+                        raise TimeoutError("预览器处理命令超时")
+                    response = request.response
+                except Exception as error:
+                    response = {"ok": False, "error": str(error)}
+                try:
+                    connection.sendall(
+                        json.dumps(response, ensure_ascii=False).encode("utf-8")
+                    )
+                except OSError:
+                    pass
+
+    def stop(self):
+        self.running = False
+        if self.socket:
+            self.socket.close()
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        if self.lock_file is not None:
+            self.lock_file.close()
+            self.lock_file = None
+
+
+def run_preview(args):
+    if args.headless:
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    from PySide6.QtCore import QObject, QTimer, Signal
+    from PySide6.QtGui import QImage, QPixmap
+    from PySide6.QtWidgets import QApplication, QLabel, QWidget
+
+    class Bridge(QObject):
+        request_received = Signal(object)
+        sample_ready = Signal(object, object)
+
+    class PreviewWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Deepcool LM Preview")
+            self.setFixedSize(WIDTH, HEIGHT)
+            self.label = QLabel(self)
+            self.label.setGeometry(0, 0, WIDTH, HEIGHT)
+            self.label.setScaledContents(False)
+
+    class PreviewController(QObject):
+        def __init__(self, app, window, bridge, socket_path, screenshot_path):
+            super().__init__()
+            self.app = app
+            self.window = window
+            self.bridge = bridge
+            self.monitor = SystemMonitor()
+            self.fonts = load_fonts()
+            self.base_snapshot = self.monitor.sample()
+            self.overrides = dict(args.overrides)
+            self.image = None
+            self.framebuffer = None
+            self.generation = 0
+            self.sampling = False
+            self.pending_refresh = []
+            self.socket_path = socket_path
+            self.screenshot_path = screenshot_path
+            self.server = ControlServer(socket_path, bridge.request_received.emit)
+
+            bridge.request_received.connect(self.handle_request)
+            bridge.sample_ready.connect(self.finish_sample)
+            self.render()
+            self.server.start()
+
+            self.timer = QTimer(self)
+            if args.interval > 0:
+                self.timer.timeout.connect(self.start_sample)
+                self.timer.start(round(args.interval * 1000))
+
+        def render(self):
+            snapshot = replace(self.base_snapshot, **self.overrides)
+            self.framebuffer = render_monitor_framebuffer(snapshot, self.fonts)
+            self.image = framebuffer_to_rgb_image(self.framebuffer)
+            raw = self.image.tobytes()
+            qimage = QImage(
+                raw,
+                WIDTH,
+                HEIGHT,
+                WIDTH * 3,
+                QImage.Format.Format_RGB888,
+            ).copy()
+            self.window.label.setPixmap(QPixmap.fromImage(qimage))
+            self.generation += 1
+
+        def start_sample(self, request=None):
+            if request is not None:
+                self.pending_refresh.append(request)
+            if self.sampling:
+                return
+            self.sampling = True
+
+            def sample():
+                try:
+                    snapshot = self.monitor.sample()
+                    error = None
+                except Exception as exception:
+                    snapshot = None
+                    error = str(exception)
+                self.bridge.sample_ready.emit(snapshot, error)
+
+            threading.Thread(target=sample, daemon=True).start()
+
+        def finish_sample(self, snapshot, error):
+            self.sampling = False
+            requests = self.pending_refresh
+            self.pending_refresh = []
+            if error:
+                for request in requests:
+                    request.complete({"ok": False, "error": error})
+                return
+
+            self.base_snapshot = snapshot
+            self.render()
+            for request in requests:
+                request.complete(self.success())
+
+        def handle_request(self, request):
+            try:
+                command = request.payload.get("command")
+                if command == "refresh":
+                    self.start_sample(request)
+                    return
+                if command == "set":
+                    updates = validate_overrides(request.payload.get("values", {}))
+                    self.overrides.update(updates)
+                    self.render()
+                    request.complete(self.success())
+                    return
+                if command == "reset":
+                    fields = request.payload.get("fields", [])
+                    if not fields:
+                        self.overrides.clear()
+                    else:
+                        unknown = set(fields) - FIELDS
+                        if unknown:
+                            raise ValueError(f"未知字段: {', '.join(sorted(unknown))}")
+                        for field in fields:
+                            self.overrides.pop(field, None)
+                    self.render()
+                    request.complete(self.success())
+                    return
+                if command == "screenshot":
+                    requested_path = request.payload.get("path")
+                    if requested_path:
+                        output = Path(requested_path)
+                    elif self.screenshot_path:
+                        output = Path(self.screenshot_path)
+                    else:
+                        output = default_preview_path()
+                    path = save_screenshot(self.image, output)
+                    response = self.success()
+                    response["path"] = str(path)
+                    request.complete(response)
+                    return
+                if command == "stop":
+                    request.complete(self.success())
+                    QTimer.singleShot(100, self.app.quit)
+                    return
+                raise ValueError(f"未知命令: {command}")
+            except Exception as error:
+                request.complete({"ok": False, "error": str(error)})
+
+        def success(self):
+            return {
+                "ok": True,
+                "generation": self.generation,
+                "size": [WIDTH, HEIGHT],
+                "framebuffer_size": len(self.framebuffer),
+            }
+
+        def close(self):
+            self.timer.stop()
+            self.server.stop()
+
+    app = QApplication(sys.argv[:1])
+    bridge = Bridge()
+    window = PreviewWindow()
+    socket_path = Path(args.socket) if args.socket else runtime_path("deepcool-lm-preview.sock")
+    socket_path = validate_socket_path(socket_path)
+    screenshot_path = Path(args.screenshot_path) if args.screenshot_path else None
+    controller = PreviewController(app, window, bridge, socket_path, screenshot_path)
+    app.aboutToQuit.connect(controller.close)
+    if not args.headless:
+        window.show()
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "status": "ready",
+                "generation": controller.generation,
+                "socket": str(socket_path),
+                "size": [WIDTH, HEIGHT],
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return app.exec()
+
+
+def send_command(socket_path, payload):
+    socket_path = validate_socket_path(socket_path)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(15)
+        client.connect(str(socket_path))
+        client.sendall(json.dumps(payload).encode("utf-8"))
+        client.shutdown(socket.SHUT_WR)
+        response = json.loads(_receive_all(client).decode("utf-8"))
+    print(json.dumps(response, ensure_ascii=False))
+    return 0 if response.get("ok") else 1
+
+
+def validate_overrides(values):
+    if not isinstance(values, dict):
+        raise ValueError("覆盖值必须是对象")
+    unknown = set(values) - FIELDS
+    if unknown:
+        raise ValueError(f"未知字段: {', '.join(sorted(unknown))}")
+
+    validated = {}
+    for field, value in values.items():
+        if field in NUMERIC_FIELDS:
+            if value is None:
+                validated[field] = None
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{field} 必须是数字或 null")
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError(f"{field} 必须是有限数字")
+            if field == "cpu_percent" and not 0 <= value <= 100:
+                raise ValueError("cpu_percent 范围必须为 0-100")
+            if field == "cpu_freq" and value < 0:
+                raise ValueError("cpu_freq 不能为负数")
+            validated[field] = value
+        elif field in BRAND_FIELDS:
+            if value not in BRANDS:
+                raise ValueError(f"{field} 必须是 {', '.join(sorted(BRANDS))} 之一")
+            validated[field] = value
+        elif field in MODEL_FIELDS:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field} 必须是非空字符串")
+            validated[field] = value.strip()
+    return validated
+
+
+def parse_assignments(assignments):
+    values = {}
+    for assignment in assignments:
+        if "=" not in assignment:
+            raise argparse.ArgumentTypeError(f"必须使用 FIELD=VALUE 格式: {assignment}")
+        field, raw_value = assignment.split("=", 1)
+        if field not in FIELDS:
+            raise argparse.ArgumentTypeError(f"未知字段: {field}")
+        if field in NUMERIC_FIELDS:
+            if raw_value.lower() in {"null", "none"}:
+                value = None
+            else:
+                try:
+                    value = float(raw_value)
+                except ValueError as error:
+                    raise argparse.ArgumentTypeError(f"{field} 必须是数字或 null") from error
+        else:
+            value = raw_value
+        values[field] = value
+    try:
+        return validate_overrides(values)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def save_screenshot(image, output):
+    if not output.is_absolute():
+        raise ValueError("截图路径必须是绝对路径")
+    output = output.expanduser().resolve()
+    if not output.parent.is_dir():
+        raise ValueError(f"截图目录不存在: {output.parent}")
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    try:
+        image.save(temporary, format="PNG")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, output)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return output
+
+
+def _receive_all(connection, limit=64 * 1024):
+    data = bytearray()
+    while True:
+        chunk = connection.recv(4096)
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+        if len(data) > limit:
+            raise ValueError(f"控制消息超过 {limit} 字节")
+
+
+def _acquire_lock(path):
+    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise RuntimeError(f"无法创建预览器锁文件 {path}: {error}") from error
+
+    lock_file = os.fdopen(descriptor, "r+")
+    status = os.fstat(lock_file.fileno())
+    if status.st_uid != os.getuid() or not stat.S_ISREG(status.st_mode):
+        lock_file.close()
+        raise RuntimeError(f"预览器锁文件无效或不属于当前用户: {path}")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        lock_file.close()
+        raise RuntimeError(f"预览器已在运行: {path.with_suffix('')}") from error
+    return lock_file
+
+
+def validate_socket_path(path):
+    path = path.expanduser().resolve()
+    if path == PRODUCTION_SOCKET:
+        raise ValueError(f"预览器禁止访问正式驱动 socket: {PRODUCTION_SOCKET}")
+    return path
+
+
+def nonnegative_interval(value):
+    try:
+        interval = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("刷新间隔必须是数字") from error
+    if interval < 0:
+        raise argparse.ArgumentTypeError("刷新间隔不能为负数")
+    return interval
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Deepcool LM 320x240 无 USB 调试预览器")
+    parser.add_argument("--socket", help="覆盖用户态控制 socket 路径")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = commands.add_parser("run", help="启动固定 320x240 预览窗口")
+    run_parser.add_argument("--interval", type=nonnegative_interval, default=2.0)
+    run_parser.add_argument("--headless", action="store_true", help="无窗口运行，用于自动验证")
+    run_parser.add_argument("--screenshot-path", help="默认截图输出路径")
+    run_parser.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE")
+
+    commands.add_parser("refresh", help="重新采集并渲染实时数据")
+    screenshot_parser = commands.add_parser("screenshot", help="保存当前原始 320x240 PNG")
+    screenshot_parser.add_argument("--output", help="PNG 输出路径")
+    set_parser = commands.add_parser("set", help="设置持续生效的调试覆盖值")
+    set_parser.add_argument("values", nargs="+", metavar="FIELD=VALUE")
+    reset_parser = commands.add_parser("reset", help="清除指定或全部覆盖值")
+    reset_parser.add_argument("fields", nargs="*", choices=sorted(FIELDS))
+    commands.add_parser("stop", help="停止预览器")
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        if args.command == "run":
+            args.overrides = parse_assignments(args.set)
+            return run_preview(args)
+
+        socket_path = Path(args.socket) if args.socket else runtime_path("deepcool-lm-preview.sock")
+        payload = {"command": args.command}
+        if args.command == "screenshot" and args.output:
+            payload["path"] = str(Path(args.output).expanduser().resolve())
+        elif args.command == "set":
+            payload["values"] = parse_assignments(args.values)
+        elif args.command == "reset":
+            payload["fields"] = args.fields
+        return send_command(socket_path, payload)
+    except (OSError, RuntimeError, ValueError, argparse.ArgumentTypeError) as error:
+        parser.exit(1, f"错误: {error}\n")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

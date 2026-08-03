@@ -57,6 +57,12 @@ if [ -f /usr/local/bin/deepcool-lm ]; then
     echo "✓ CLI tool removed"
 fi
 
+# Remove shared Python modules installed by install.sh
+if [ -d /usr/local/lib/deepcool-lm ]; then
+    echo "🗑️  Removing shared Python modules..."
+    rm -rf /usr/local/lib/deepcool-lm
+fi
+
 # Remove socket files
 rm -f /var/run/lm360.sock /var/run/deepcool-lm.sock 2>/dev/null || true
 

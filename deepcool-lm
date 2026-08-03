@@ -1,1087 +1,378 @@
 #!/usr/bin/env python3
-"""
-Deepcool LM360 LCD Driver - Unified CLI Tool
-Supports system monitoring, brightness control, and custom image rendering
-"""
-import usb.core
-import usb.util
-import sys
-import time
+"""Deepcool LM 系列 LCD 的 USB、IPC 和命令行入口。"""
+
 import argparse
-import psutil
-import socket
 import json
 import os
+import socket
+import sys
 import threading
-import re
-from PIL import Image, ImageDraw, ImageFont
+import time
+from pathlib import Path
+
+# 安装后共享模块位于与 bin 同前缀的 lib/deepcool-lm；仓库内运行时无需此路径。
+MODULE_DIRECTORY = Path(__file__).resolve().parent.parent / "lib" / "deepcool-lm"
+if MODULE_DIRECTORY.is_dir():
+    sys.path.insert(0, str(MODULE_DIRECTORY))
+
+import usb.core
+import usb.util
+
+from deepcool_lm_display import (
+    FRAMEBUFFER_SIZE,
+    load_fonts,
+    render_monitor_framebuffer,
+    render_solid_image,
+    rgb_to_framebuffer,
+)
+from deepcool_lm_system import SystemMonitor
+
 
 VENDOR_ID = 0x3633
 PRODUCT_ID = 0x0026
 EP_OUT = 0x01
-WIDTH = 320
-HEIGHT = 240
-
-# Frame header that works
-FRAME_HEADER = bytes([0xaa, 0x08, 0x00, 0x00, 0x01, 0x00, 0x58, 0x02, 0x00, 0x2c, 0x01, 0xbc, 0x11])
-
-# IPC socket path
 SOCKET_PATH = "/var/run/deepcool-lm.sock"
 
+# 这些字节来自对 Windows 驱动协议的逆向，不属于普通界面配置。
+FRAME_HEADER = bytes(
+    [0xAA, 0x08, 0x00, 0x00, 0x01, 0x00, 0x58, 0x02, 0x00, 0x2C, 0x01, 0xBC, 0x11]
+)
+BRIGHTNESS_UP = bytes([0xAA, 0x04, 0x00, 0x06, 0x03, 0x61, 0x00, 0xD2, 0x46])
+BRIGHTNESS_DOWN = bytes([0xAA, 0x04, 0x00, 0x06, 0x03, 0x1D, 0x00, 0xE6, 0x0B])
+INIT_QUERY = bytes([0xAA, 0x01, 0x00, 0x09, 0x29, 0x91])
+
+
 class DisplayState:
-    """Manages the current display state"""
     def __init__(self):
-        self.mode = 'monitor'  # 'monitor', 'image', 'solid'
-        self.data = None  # Store image framebuffer or color
-        self.lock = threading.Lock()
+        self._mode = "monitor"
+        self._framebuffer = None
+        self._lock = threading.Lock()
 
-    def set_monitor_mode(self):
-        with self.lock:
-            self.mode = 'monitor'
-            self.data = None
+    def set_monitor(self):
+        with self._lock:
+            self._mode = "monitor"
+            self._framebuffer = None
 
-    def set_image_mode(self, framebuffer):
-        with self.lock:
-            self.mode = 'image'
-            self.data = framebuffer
+    def set_solid(self, framebuffer):
+        with self._lock:
+            self._mode = "solid"
+            self._framebuffer = framebuffer
 
-    def set_solid_mode(self, framebuffer):
-        with self.lock:
-            self.mode = 'solid'
-            self.data = framebuffer
+    def get(self):
+        with self._lock:
+            return self._mode, self._framebuffer
 
-    def get_state(self):
-        with self.lock:
-            return self.mode, self.data
 
 class IPCServer:
-    """Unix socket server for IPC communication"""
     def __init__(self, device, display_state):
         self.device = device
         self.display_state = display_state
-        self.socket_path = SOCKET_PATH
         self.running = False
         self.server_socket = None
 
     def start(self):
-        """Start the IPC server in a background thread"""
-        # Remove old socket if it exists
         try:
-            os.unlink(self.socket_path)
-        except OSError:
-            if os.path.exists(self.socket_path):
-                raise
+            os.unlink(SOCKET_PATH)
+        except FileNotFoundError:
+            pass
 
         self.server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.server_socket.bind(self.socket_path)
-        os.chmod(self.socket_path, 0o666)  # Allow all users to connect
-        self.server_socket.listen(1)
+        self.server_socket.bind(SOCKET_PATH)
+        os.chmod(SOCKET_PATH, 0o666)
+        self.server_socket.listen(4)
         self.running = True
+        threading.Thread(target=self._serve, daemon=True).start()
 
-        # Start server thread
-        thread = threading.Thread(target=self._server_loop, daemon=True)
-        thread.start()
-
-    def _server_loop(self):
-        """Accept and handle client connections"""
+    def _serve(self):
         while self.running:
             try:
-                conn, _ = self.server_socket.accept()
-                self._handle_client(conn)
-            except Exception as e:
-                if self.running:
-                    print(f"IPC server error: {e}", file=sys.stderr)
+                connection, _ = self.server_socket.accept()
+            except OSError:
+                break
+            connection.settimeout(5)
+            self._handle(connection)
 
-    def _handle_client(self, conn):
-        """Handle a single client request"""
+    def _handle(self, connection):
         try:
-            # Receive command (max 10MB for images)
-            data = b''
-            while True:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if len(data) > 10 * 1024 * 1024:  # 10MB limit
-                    break
+            raw_request = _receive_all(connection, 64 * 1024)
+            request = json.loads(raw_request.decode("utf-8"))
+            action = request.get("action")
 
-            if not data:
-                return
-
-            # Parse command
-            cmd = json.loads(data.decode('utf-8'))
-            action = cmd.get('action')
-
-            # Execute command
-            response = {'status': 'ok'}
-
-            if action == 'brightness_up':
+            if action == "brightness_up":
                 self.device.brightness_up()
-            elif action == 'brightness_down':
+            elif action == "brightness_down":
                 self.device.brightness_down()
-            elif action == 'monitor':
-                # Switch back to monitor mode
-                self.display_state.set_monitor_mode()
-            elif action == 'image':
-                # Image data is base64 encoded in the command
-                import base64
-                img_data = base64.b64decode(cmd['data'])
-                from io import BytesIO
-                img = Image.open(BytesIO(img_data))
-                framebuffer = rgb_to_framebuffer(img)
-                self.display_state.set_image_mode(framebuffer)
-            elif action == 'solid':
-                color = tuple(cmd['color'])
-                img = Image.new('RGB', (WIDTH, HEIGHT), color=color)
-                framebuffer = rgb_to_framebuffer(img)
-                self.display_state.set_solid_mode(framebuffer)
+            elif action == "monitor":
+                self.display_state.set_monitor()
+            elif action == "solid":
+                color = _validate_color(request.get("color"))
+                framebuffer = rgb_to_framebuffer(render_solid_image(color))
+                self.display_state.set_solid(framebuffer)
             else:
-                response = {'status': 'error', 'message': f'Unknown action: {action}'}
+                raise ValueError(f"未知操作: {action}")
+            response = {"status": "ok"}
+        except Exception as error:
+            response = {"status": "error", "message": str(error)}
 
-            # Send response
-            conn.sendall(json.dumps(response).encode('utf-8'))
-
-        except Exception as e:
-            error_response = {'status': 'error', 'message': str(e)}
-            try:
-                conn.sendall(json.dumps(error_response).encode('utf-8'))
-            except:
-                pass
+        try:
+            connection.sendall(json.dumps(response).encode("utf-8"))
+        except OSError:
+            pass
         finally:
-            conn.close()
+            connection.close()
 
     def stop(self):
-        """Stop the IPC server"""
         self.running = False
         if self.server_socket:
             self.server_socket.close()
         try:
-            os.unlink(self.socket_path)
-        except:
+            os.unlink(SOCKET_PATH)
+        except FileNotFoundError:
             pass
 
-def send_ipc_command(cmd):
-    """Send a command to the running service via IPC"""
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(SOCKET_PATH)
-        sock.sendall(json.dumps(cmd).encode('utf-8'))
-        sock.shutdown(socket.SHUT_WR)
 
-        # Receive response
-        response = b''
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            response += chunk
-
-        sock.close()
-        return json.loads(response.decode('utf-8'))
-    except FileNotFoundError:
-        return None  # Service not running
-    except Exception as e:
-        return {'status': 'error', 'message': str(e)}
-
-class LM360:
+class LMDisplay:
     def __init__(self):
-        self.dev = None
+        self.device = None
         self.interface = 0
 
     def connect(self):
-        self.dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
-        if self.dev is None:
+        self.device = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
+        if self.device is None:
             return False
-        if self.dev.is_kernel_driver_active(self.interface):
+
+        if self.device.is_kernel_driver_active(self.interface):
             try:
-                self.dev.detach_kernel_driver(self.interface)
-            except:
+                self.device.detach_kernel_driver(self.interface)
+            except Exception:
                 pass
         try:
-            self.dev.set_configuration()
-            usb.util.claim_interface(self.dev, self.interface)
-        except:
+            self.device.set_configuration()
+            usb.util.claim_interface(self.device, self.interface)
+        except Exception:
+            self.disconnect()
             return False
         return True
 
     def write(self, data):
         try:
-            return self.dev.write(EP_OUT, data, timeout=5000)
-        except Exception as e:
-            print(f"Write error: {e}")
-            return 0
+            written = self.device.write(EP_OUT, data, timeout=5000)
+        except Exception as error:
+            raise RuntimeError(f"USB 写入失败: {error}") from error
+        if written != len(data):
+            raise RuntimeError(f"USB 写入不完整: {written}/{len(data)} 字节")
 
     def send_frame(self, framebuffer):
-        """Send a frame to the display"""
+        if len(framebuffer) != FRAMEBUFFER_SIZE:
+            raise ValueError(
+                f"帧缓冲区长度错误: {len(framebuffer)}，应为 {FRAMEBUFFER_SIZE}"
+            )
         self.write(FRAME_HEADER)
         self.write(framebuffer)
 
     def brightness_up(self):
-        """Increase brightness"""
-        cmd = bytes([0xaa, 0x04, 0x00, 0x06, 0x03, 0x61, 0x00, 0xd2, 0x46])
-        self.write(cmd)
+        self.write(BRIGHTNESS_UP)
 
     def brightness_down(self):
-        """Decrease brightness"""
-        cmd = bytes([0xaa, 0x04, 0x00, 0x06, 0x03, 0x1d, 0x00, 0xe6, 0x0b])
-        self.write(cmd)
+        self.write(BRIGHTNESS_DOWN)
 
-    def zen_mode_toggle(self):
-        """Toggle Zen mode (screen off/on)"""
-        cmd = bytes([0xaa, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00, 0xdc, 0x9b])
-        self.write(cmd)
-
-    def init_query(self):
-        """Send init/query command"""
-        cmd = bytes([0xaa, 0x01, 0x00, 0x09, 0x29, 0x91])
-        self.write(cmd)
-
-    def usb_reset(self):
-        """Perform USB reset"""
-        if self.dev:
-            try:
-                self.dev.reset()
-            except:
-                pass
+    def initialize(self):
+        self.write(INIT_QUERY)
 
     def disconnect(self):
-        if self.dev:
-            try:
-                usb.util.release_interface(self.dev, self.interface)
-                usb.util.dispose_resources(self.dev)
-            except:
-                pass
-
-# ============================================================================
-# System Info & Rendering Functions
-# ============================================================================
-
-def get_cpu_model():
-    """获取 CPU 型号和品牌"""
-    try:
-        with open('/proc/cpuinfo', 'r') as f:
-            content = f.read()
-            
-        match = re.search(r'model name\s*:\s*(.+)', content)
-        if match:
-            full_name = match.group(1).strip()
-            
-            if 'AMD' in full_name:
-                # AMD Ryzen 7 7800X3D 16-Core Processor -> Ryzen 7 7800X3D
-                # 去掉 AMD 前缀，去掉后面多余
-                short = re.sub(r'^AMD\s+', '', full_name)  # 只去掉开头的 AMD
-                short = re.sub(r'\s+\d+-Core.*$', '', short)  # 去掉 "16-Core Processor"
-                short = re.sub(r'\s+Processor.*$', '', short)  # 去掉 "Processor"
-                # 限制长度但保证词完整
-                if len(short) > 15:
-                    short = short[:15].rsplit(' ', 1)[0]
-                return 'AMD', short
-                
-            elif 'Intel' in full_name:
-                # Intel(R) Core(TM) i7-14700K -> Core i7-14700K
-                # Intel(R) Xeon(R) E5-2680 -> Xeon E5-2680
-                short = re.sub(r'Intel\(R\)\s+', '', full_name)
-                short = re.sub(r'Core\(TM\)\s+', 'Core ', short)
-                short = re.sub(r'Xeon\(R\)\s+', 'Xeon ', short)
-                short = re.sub(r'Pentium\(R\)\s+', 'Pentium ', short)
-                short = re.sub(r'Celeron\(R\)\s+', 'Celeron ', short)
-                short = re.sub(r'\s+CPU.*$', '', short)  # 去掉 "CPU @ 3.50GHz"
-                short = re.sub(r'\s+@.*$', '', short)    # 去掉 "@ 3.50GHz"
-                if len(short) > 15:
-                    short = short[:15].rsplit(' ', 1)[0]
-                return 'Intel', short
-            else:
-                short = full_name[:15]
-                return 'Unknown', short
-    except Exception as e:
-        print(f"CPU detection error: {e}")
-    return 'Unknown', 'Unknown'
-
-# def get_gpu_model():
-    """获取 GPU 型号和品牌"""
-    gpu_info = {'brand': 'Unknown', 'model': 'Unknown', 'temp_source': None}
-    
-    try:
-        temps = psutil.sensors_temperatures()
-        
-        # 1. 检查 AMD GPU
-        if 'amdgpu' in temps:
-            gpu_info['brand'] = 'AMD'
-            gpu_info['temp_source'] = 'amdgpu'
-            try:
-                import subprocess
-                result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
-                for line in result.stdout.split('\n'):
-                    if ('VGA' in line or '3D controller' in line) and ('AMD' in line or 'ATI' in line):
-                        # 示例: "VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]"
-                        # 提取方括号后的部分
-                        if ']' in line:
-                            model_part = line.split(']')[-1].strip()
-                            # 去掉 [Radeon RX 7900 XTX] 中的括号内容，保留主要名称
-                            model = re.sub(r'\[.*?\]', '', model_part)
-                            model = model.strip()
-                            # 精简: Radeon RX 7900 XTX -> RX 7900 XTX
-                            model = re.sub(r'^Radeon\s+', '', model)
-                            if len(model) > 15:
-                                model = model[:15].rsplit(' ', 1)[0]
-                            gpu_info['model'] = model if model else 'Radeon'
-                        else:
-                            gpu_info['model'] = 'Radeon'
-                        break
-            except:
-                gpu_info['model'] = 'Radeon'
-            return gpu_info
-        
-        # 2. 检查 NVIDIA（nvidia-smi）
+        if not self.device:
+            return
         try:
-            import subprocess
-            result = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-                                  capture_output=True, text=True, timeout=2)
-            if result.returncode == 0 and result.stdout.strip():
-                name = result.stdout.strip()
-                gpu_info['brand'] = 'NVIDIA'
-                gpu_info['temp_source'] = 'nvidia-smi'
-                # 简化型号 - 先匹配长的，再匹配短的
-                # "NVIDIA GeForce RTX 4090" -> "RTX 4090"
-                # "NVIDIA RTX A6000" -> "RTX A6000"  
-                # "NVIDIA TITAN Xp" -> "TITAN Xp"
-                # "GeForce GTX 1080 Ti" -> "GTX 1080 Ti"
-                
-                short = name
-                
-                # 完整前缀
-                short = re.sub(r'^NVIDIA\s+GeForce\s+', '', short)
-                short = re.sub(r'^NVIDIA\s+', '', short)
-                short = re.sub(r'^GeForce\s+', '', short)  # 有些输出不带 NVIDIA 前缀
-                
-                # 其他前缀
-                short = re.sub(r'^Quadro\s+', '', short)
-                short = re.sub(r'^Tesla\s+', '', short)
-                short = re.sub(r'^TITAN\s+', 'TITAN ', short)  # 保留 TITAN 名称
-                
-                if len(short) > 15:
-                    short = short[:15].rsplit(' ', 1)[0]
-                gpu_info['model'] = short if short else 'NVIDIA'
-                return gpu_info
-        except:
+            usb.util.release_interface(self.device, self.interface)
+            usb.util.dispose_resources(self.device)
+        except Exception:
             pass
-        
-        # 3. 检查 nouveau
-        if 'nouveau' in temps:
-            gpu_info['brand'] = 'NVIDIA'
-            gpu_info['temp_source'] = 'nouveau'
-            gpu_info['model'] = 'NVIDIA'
-            return gpu_info
-        
-        # 4. 检查 Intel
-        if 'i915' in temps:
-            gpu_info['brand'] = 'Intel'
-            gpu_info['temp_source'] = 'i915'
-            gpu_info['model'] = 'Integrated'
-            return gpu_info
-            
-    except Exception as e:
-        print(f"GPU detection error: {e}")
-    
-    return gpu_info
+        finally:
+            self.device = None
 
-def get_gpu_model():
-    """获取 GPU 型号和品牌"""
-    gpu_info = {'brand': 'Unknown', 'model': 'Unknown', 'temp_source': None}
-    
+
+def send_ipc_command(command):
     try:
-        temps = psutil.sensors_temperatures()
-        
-        # 1. 检查 AMD GPU
-        if 'amdgpu' in temps:
-            gpu_info['brand'] = 'AMD'
-            gpu_info['temp_source'] = 'amdgpu'
-            try:
-                import subprocess
-                result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
-                for line in result.stdout.split('\n'):
-                    if ('VGA' in line or '3D controller' in line) and ('AMD' in line or 'ATI' in line):
-                        # 示例: "VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]"
-                        # 提取方括号后的部分
-                        if ']' in line:
-                            model_part = line.split(']')[-1].strip()
-                            # 去掉 [Radeon RX 7900 XTX] 中的括号内容，保留主要名称
-                            model = re.sub(r'\[.*?\]', '', model_part)
-                            model = model.strip()
-                            # 精简: Radeon RX 7900 XTX -> RX 7900 XTX
-                            model = re.sub(r'^Radeon\s+', '', model)
-                            if len(model) > 15:
-                                model = model[:15].rsplit(' ', 1)[0]
-                            gpu_info['model'] = model if model else 'Radeon'
-                        else:
-                            gpu_info['model'] = 'Radeon'
-                        break
-            except:
-                gpu_info['model'] = 'Radeon'
-            return gpu_info
-        
-        # 2. 检查 NVIDIA（nvidia-smi）
-        try:
-            import subprocess
-            result = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-                                  capture_output=True, text=True, timeout=2)
-            if result.returncode == 0 and result.stdout.strip():
-                name = result.stdout.strip()
-                gpu_info['brand'] = 'NVIDIA'
-                gpu_info['temp_source'] = 'nvidia-smi'
-                # 保留完整名称，不再截断
-                # 简化型号 - 先匹配长的，再匹配短的
-                # "NVIDIA GeForce RTX 4090" -> "RTX 4090"
-                # "NVIDIA RTX A6000" -> "RTX A6000"  
-                # "NVIDIA TITAN Xp" -> "TITAN Xp"
-                # "GeForce GTX 1080 Ti" -> "GTX 1080 Ti"
-                
-                short = name
-                
-                # 完整前缀
-                short = re.sub(r'^NVIDIA\s+GeForce\s+', '', short)
-                short = re.sub(r'^NVIDIA\s+', '', short)
-                short = re.sub(r'^GeForce\s+', '', short)  # 有些输出不带 NVIDIA 前缀
-                
-                # 其他前缀
-                short = re.sub(r'^Quadro\s+', '', short)
-                short = re.sub(r'^Tesla\s+', '', short)
-                short = re.sub(r'^TITAN\s+', 'TITAN ', short)  # 保留 TITAN 名称
-                
-                # 关键修改：保留完整型号，不再按长度截断
-                gpu_info['model'] = short if short else 'NVIDIA'
-                return gpu_info
-        except:
-            pass
-        
-        # 3. 检查 nouveau
-        if 'nouveau' in temps:
-            gpu_info['brand'] = 'NVIDIA'
-            gpu_info['temp_source'] = 'nouveau'
-            gpu_info['model'] = 'NVIDIA'
-            return gpu_info
-        
-        # 4. 检查 Intel
-        if 'i915' in temps:
-            gpu_info['brand'] = 'Intel'
-            gpu_info['temp_source'] = 'i915'
-            gpu_info['model'] = 'Integrated'
-            return gpu_info
-            
-    except Exception as e:
-        print(f"GPU detection error: {e}")
-    
-    return gpu_info
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(SOCKET_PATH)
+            client.sendall(json.dumps(command).encode("utf-8"))
+            client.shutdown(socket.SHUT_WR)
+            response = _receive_all(client, 64 * 1024)
+    except (FileNotFoundError, ConnectionRefusedError):
+        return None
+    except OSError as error:
+        return {"status": "error", "message": str(error)}
 
-def parse_gpu_model(model):
-    """
-    解析 GPU 型号，分离基础型号和后缀
-    例如: "RTX 4070 Ti Super" -> ("RTX 4070", "Ti Super")
-          "RX 7900 XTX" -> ("RX 7900", "XTX")
-    """
-    model = model.strip()
-    
-    # 先标准化：确保 Ti/Super/XTX 前有空格
-    model = re.sub(r'(\d)(Ti|Super|XTX|XT|GRE)', r'\1 \2', model)
-    model = re.sub(r'(Ti)(Super)', r'\1 \2', model)
-    
-    # 匹配基础型号：前缀 + 数字（必须结束或跟空格）
-    match = re.match(r'^((?:RTX|RX|GTX|R\d+|Pro)?\s*\d{3,4})\b(.*)', model)
-    
-    if match:
-        base = match.group(1).strip()
-        suffix = match.group(2).strip()
-        
-        # 如果基础型号还包含 Ti（不应该），分离出来
-        if 'Ti' in base and 'Ti' in suffix:
-            base = base.replace('Ti', '').strip()
-        
-        return base, suffix
-    
-    return model, ""
-
-def get_brand_color(brand):
-    """返回品牌对应颜色"""
-    colors = {
-        'AMD': (255, 50, 50),      # 红色
-        'Intel': (100, 150, 255),  # 蓝色
-        'NVIDIA': (100, 255, 100), # 绿色
-    }
-    return colors.get(brand, (150, 150, 150))  # 默认灰色
-
-_cpu_cache = None
-_gpu_cache = None
-
-def get_cached_cpu_info():
-    global _cpu_cache
-    if _cpu_cache is None:
-        brand, model = get_cpu_model()
-        _cpu_cache = (brand, model, get_brand_color(brand))
-    return _cpu_cache
-
-def get_cached_gpu_info():
-    global _gpu_cache
-    if _gpu_cache is None:
-        _gpu_cache = get_gpu_model()
-    return _gpu_cache
-
-def get_temp_color(temp):
-    """Return color gradient based on temperature"""
-    if temp < 40:
-        return (100, 200, 255)  # Cool blue
-    elif temp < 60:
-        return (100, 255, 100)  # Green
-    elif temp < 75:
-        return (255, 220, 50)   # Yellow
-    elif temp < 85:
-        return (255, 140, 0)    # Orange
-    else:
-        return (255, 50, 50)    # Red
-
-def get_usage_color(percent):
-    """CPU 使用率颜色: 低(蓝) -> 中(绿) -> 中高(黄) -> 满载(红)"""
-    if percent < 30:
-        return (100, 200, 255)   # 蓝色：低负载 <30%
-    elif percent < 60:
-        return (100, 255, 100)   # 绿色：中负载 30-60%
-    elif percent < 85:
-        return (255, 220, 50)    # 黄色：中高负载 60-85%
-    else:
-        return (255, 50, 50)     # 红色：满载 >=85%
-
-def get_freq_color(freq_ghz):
-    """CPU 频率颜色: 低(蓝) -> 中(绿) -> 中高(黄) -> 高(红)"""
-
-    
-    if freq_ghz < 3.5:
-        return (100, 200, 255)   # 蓝色：低频/节能 <50%
-    elif freq_ghz < 4.5:
-        return (100, 255, 100)   # 绿色：中频 50-75%
-    elif freq_ghz < 5.2:
-        return (255, 220, 50)    # 黄色：中高频 75-90%
-    else:
-        return (255, 50, 50)     # 红色：高频/睿频 >=90%
-
-def load_fonts():
-    """Load fonts with fallback"""
     try:
-        return {
-            'medium': ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 40),
-            'normal': ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans.ttf", 26),
-            'normal_bold': ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 26),
-            'small': ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans.ttf", 20),
-        }
-    except:
-        default = ImageFont.load_default()
-        return {k: default for k in ['medium', 'normal', 'normal_bold', 'small']}
+        return json.loads(response.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return {"status": "error", "message": f"IPC 响应无效: {error}"}
 
-def get_system_info():
-    """Get all system information"""
-    info = {
-        'cpu_temp': 0.0,
-        'gpu_temp': 0.0,
-        'cpu_percent': 0.0,
-        'cpu_freq': 0.0,
-    }
 
-    # CPU temperature
-    try:
-        temps = psutil.sensors_temperatures()
-        # if 'coretemp' in temps and len(temps['coretemp']) > 0:
-        #     info['cpu_temp'] = round(temps['coretemp'][0].current, 1)
-        # 优先找 AMD 的 k10temp
-        if 'k10temp' in temps:
-            # 遍历所有传感器，寻找 Tctl 或 Tdie
-            found = False
-            for sensor in temps['k10temp']:
-                if sensor.label in ['Tctl', 'Tdie']:
-                    info['cpu_temp'] = round(sensor.current, 1)
-                    found = True
-                    break
-            # 如果没找到标签，才退而求其次用第一个
-            if not found and len(temps['k10temp']) > 0:
-                info['cpu_temp'] = round(temps['k10temp'][0].current, 1)
-
-        # 如果是 Intel 或其他情况 (备用)
-        elif 'coretemp' in temps:
-             if len(temps['coretemp']) > 0:
-                info['cpu_temp'] = round(temps['coretemp'][0].current, 1)
-
-        # if 'nvme' in temps and len(temps['nvme']) > 0:
-        #     info['gpu_temp'] = round(temps['nvme'][0].current, 1)
-        if 'amdgpu' in temps and len(temps['amdgpu']) > 0:
-             info['gpu_temp'] = round(temps['amdgpu'][0].current, 1)
-        if info['gpu_temp'] == 0.0:
-            try:
-                import subprocess
-                result = subprocess.run(
-                    ['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader,nounits'],
-                    capture_output=True, text=True, timeout=2
-                )
-                if result.returncode == 0:
-                    temp_str = result.stdout.strip()
-                    if temp_str:
-                        info['gpu_temp'] = float(temp_str)
-            except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
-                pass  # nvidia-smi 不可用或执行失败
-    except:
-        pass
-
-    # CPU usage and frequency
-    try:
-        info['cpu_percent'] = round(psutil.cpu_percent(interval=0.1), 1)
-        freq = psutil.cpu_freq()
-        if freq:
-            info['cpu_freq'] = round(freq.current / 1000, 2)
-    except:
-        pass
-
-    return info
-
-def rgb_to_framebuffer(img):
-    """Convert PIL RGB image to RGB565 framebuffer"""
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
-    if img.size != (WIDTH, HEIGHT):
-        img = img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
-
-    framebuffer = bytearray()
-    pixels = img.load()
-
-    for y in range(HEIGHT):
-        for x in range(WIDTH):
-            r, g, b = pixels[x, y]
-            # Convert to RGB565
-            r5 = (r >> 3) & 0x1F
-            g6 = (g >> 2) & 0x3F
-            b5 = (b >> 3) & 0x1F
-            rgb565 = (r5 << 11) | (g6 << 5) | b5
-            # Append as little-endian
-            framebuffer.append(rgb565 & 0xFF)
-            framebuffer.append((rgb565 >> 8) & 0xFF)
-
-    return bytes(framebuffer)
-
-def draw_rounded_rect(draw, xy, radius, fill=None, outline=None, width=1):
-    """Draw a rounded rectangle using PIL's built-in method"""
-    draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=width)
-
-def render_monitor_display(info, fonts):
-    """Main monitoring layout with CPU and GPU as 2 equal rows"""
-    img = Image.new('RGB', (WIDTH, HEIGHT), color=(14, 14, 18))
-    draw = ImageDraw.Draw(img)
-
-    # 获取型号信息（带缓存）
-    cpu_brand, cpu_model, cpu_brand_color = get_cached_cpu_info()
-    gpu_info = get_cached_gpu_info()
-
-    # === CPU SECTION (Top Half) ===
-    cpu_color = get_temp_color(info['cpu_temp'])
-    usage_color = get_usage_color(info['cpu_percent'])
-    freq_color = get_freq_color(info['cpu_freq'])
-
-    # CPU rounded border box
-    draw_rounded_rect(draw, [12, 10, 308, 125], radius=8, outline=(40, 40, 50), width=2)
-
-    # CPU Label (BOLD) with icon and temperature
-
-    # 尝试用 normal_bold，如果太长改用 normal
-    icon_text = "⚙ "
-    model_text = cpu_model
-    
-    # 先尝试用 medium 字号（小一点）
-    test_bbox = draw.textbbox((0, 0), icon_text + model_text, font=fonts['normal'])
-    test_w = test_bbox[2] - test_bbox[0]
-    
-    # 如果总宽度超过 200，缩短型号
-    max_width = 200
-    if test_w > max_width:
-        # 尝试缩短：Ryzen 7 7800X3D -> Ryzen 7800X3D 或 R7 7800X3D
-        short_model = model_text.replace("Ryzen ", "R").replace("Core ", "").replace("Xeon ", "")
-        test_bbox = draw.textbbox((0, 0), icon_text + short_model, font=fonts['normal'])
-        test_w = test_bbox[2] - test_bbox[0]
-        
-        if test_w > max_width:
-            # 还是太长，直接截断
-            while test_w > max_width and len(short_model) > 3:
-                short_model = short_model[:-1]
-                test_bbox = draw.textbbox((0, 0), icon_text + short_model + "...", font=fonts['normal'])
-                test_w = test_bbox[2] - test_bbox[0]
-            model_text = short_model + "..."
-        else:
-            model_text = short_model
-    
-    # 使用 normal 字体（比 normal_bold 小）
-    draw.text((20, 22), icon_text + model_text, fill=cpu_brand_color, font=fonts['normal'])
-
-    cpu_temp_text = f"{info['cpu_temp']:.0f}°"
-    bbox = draw.textbbox((0, 0), cpu_temp_text, font=fonts['medium'])
-    text_w = bbox[2] - bbox[0]
-    draw.text((WIDTH - 20 - text_w, 20), cpu_temp_text, fill=cpu_color, font=fonts['medium'])
-
-    # CPU Usage details
-    # usage_detail = f"Usage: {info['cpu_percent']:.0f}% • {info['cpu_freq']:.2f} GHz"
-    # draw.text((20, 68), usage_detail, fill=(130, 130, 150), font=fonts['small'])
-
-    # CPU 使用率详情 - 分颜色显示
-    # "Usage:" 标签用默认色，数值用 usage_color
-    # draw.text((20, 68), "Usage: ", fill=(130, 130, 150), font=fonts['small'])
-    usage_label_text = "Usage: "
-    draw.text((20, 68), usage_label_text, fill=tuple(max(0, c - 30) for c in cpu_brand_color), font=fonts['small'])
-
-    usage_label_bbox = draw.textbbox((0, 0), "Usage:", font=fonts['small'])
-    usage_label_w = usage_label_bbox[2] - usage_label_bbox[0]
-    
-    usage_text = f"{info['cpu_percent']:.0f}%"
-    # bbox = draw.textbbox((0, 0), usage_text, font=fonts['small'])
-    # usage_w = bbox[2] - bbox[0]
-    draw.text((20 + usage_label_w + 2, 68), usage_text, fill=usage_color, font=fonts['small'])
-
-    usage_bbox = draw.textbbox((0, 0), usage_text, font=fonts['small'])
-    usage_w = usage_bbox[2] - usage_bbox[0]
-    
-    # "•" 分隔符用默认色
-    separator_x = 20 + usage_label_w + 2 + usage_w + 4
-    draw.text((separator_x, 68), "•", fill=(130, 130, 150), font=fonts['small'])
-
-    # 计算分隔符宽度
-    sep_bbox = draw.textbbox((0, 0), "•", font=fonts['small'])
-    sep_w = sep_bbox[2] - sep_bbox[0]
-    
-    # 频率值用 freq_color
-    freq_text = f"{info['cpu_freq']:.2f} GHz"
-    draw.text((separator_x + sep_w + 4, 68), freq_text, fill=freq_color, font=fonts['small'])
-
-    # CPU Progress bar - full width with rounded corners
-    bar_x, bar_y, bar_w, bar_h = 23, 93, WIDTH - 46, 18
-    bar_radius = bar_h // 2  # Fully rounded (half the height)
-    draw_rounded_rect(draw, [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
-                      radius=bar_radius, fill=(30, 30, 38), outline=None)
-    temp_ratio = min(info['cpu_temp'], 100.0) / 100.0
-    fill_w = int(bar_w * temp_ratio)
-    if fill_w >= bar_radius * 2:  # Only draw if wide enough for rounded corners
-        # bar_color = (100, 180, 255) if info['cpu_percent'] < 75 else (255, 150, 50)
-        # draw_rounded_rect(draw, [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
-        #                   radius=bar_radius, fill=bar_color, outline=None)
-        draw_rounded_rect(draw, [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
-                            radius=bar_radius, fill=cpu_color, outline=None)
-        
-    # === GPU SECTION (Bottom Half) ===
-    gpu_color = get_temp_color(info['gpu_temp'])
-
-    # GPU rounded border box
-    draw_rounded_rect(draw, [12, 135, 308, 230], radius=8, outline=(40, 40, 50), width=2)
-
-    # GPU Label (BOLD) with icon and temperature
-    gpu_temp = info['gpu_temp']
-    gpu_temp_text = f"{gpu_temp:.0f}°" if gpu_temp is not None else "N/A"
-    gpu_temp_bbox = draw.textbbox((0, 0), gpu_temp_text, font=fonts['medium'])
-    gpu_temp_w = gpu_temp_bbox[2] - gpu_temp_bbox[0]
-    gpu_temp_x = WIDTH - 20 - gpu_temp_w
-    gpu_temp_y = 145
-    max_gpu_model_width = gpu_temp_x - 20 - 10
-    # 简化的后缀处理逻辑
-    gpu_model_text = gpu_info['model'] if gpu_info['model'] != 'Unknown' else "GPU"
-    gpu_brand_color = get_brand_color(gpu_info['brand'])
-
-    # 尝试识别后缀（Ti, Super, XTX等），但保留完整名称
-    original_model = gpu_model_text
-    suffix = ""
-
-    # 检查是否有后缀
-    for suffix_candidate in ['Ti', 'Super', 'XTX', 'XT', 'GRE']:
-        if suffix_candidate in original_model:
-            # 找到后缀的位置
-            suffix_pos = original_model.find(suffix_candidate)
-            # 分离基础型号和后缀
-            base_model = original_model[:suffix_pos].strip()
-            suffix = original_model[suffix_pos:].strip()
-            break
-    else:
-        # 没有找到特殊后缀，使用完整模型名作为基础型号
-        base_model = original_model
-
-    # 检查基础型号宽度...
-    gpu_icon_text = "▣ "
-    test_bbox = draw.textbbox((0, 0), gpu_icon_text + base_model, font=fonts['normal'])
-    test_w = test_bbox[2] - test_bbox[0]
-
-    if test_w > max_gpu_model_width:
-        # 截断基础型号
-        while len(base_model) > 3:
-            base_model = base_model[:-1]
-            test_text = gpu_icon_text + base_model + "..."
-            test_bbox = draw.textbbox((0, 0), test_text, font=fonts['normal'])
-            if test_bbox[2] - test_bbox[0] <= max_gpu_model_width:
-                base_model = base_model + "..."
-                break
-    
-    # 绘制 GPU 图标和基础型号
-    icon_x = 20
-    icon_y = 145
-    draw.text((20, 145), gpu_icon_text, fill=gpu_brand_color, font=fonts['normal'])
-    
-    icon_bbox = draw.textbbox((0, 0), gpu_icon_text, font=fonts['normal'])
-    icon_w = icon_bbox[2] - icon_bbox[0]
-    base_x = icon_x + icon_w
-    base_y = icon_y
-    draw.text((20 + icon_w, 145), base_model, fill=gpu_brand_color, font=fonts['normal'])
-    
-    # 绘制后缀（小字）- 放在右下角
-    if suffix:
-        # 计算基础型号的实际宽度
-        base_bbox = draw.textbbox((0, 0), base_model, font=fonts['normal'])
-        base_w = base_bbox[2] - base_bbox[0]
-        
-        # 后缀放在基础型号的右侧
-        suffix_x = base_x + base_w + 2  # 基础型号右侧，留2px间隙
-        suffix_y = base_y + 6  # 稍微向下偏移，与基础型号对齐
-        
-        # 检查后缀是否会超出温度文本的左边界
-        suffix_bbox = draw.textbbox((0, 0), suffix, font=fonts['small'])
-        suffix_w = suffix_bbox[2] - suffix_bbox[0]
-        
-        if suffix_x + suffix_w < gpu_temp_x - 5:  # 确保不覆盖温度
-            suffix_color = tuple(max(0, c - 50) for c in gpu_brand_color)
-            draw.text((suffix_x, suffix_y), suffix, fill=suffix_color, font=fonts['small'])
-        else:
-            # 如果空间不够，尝试换行显示
-            suffix_y_new = base_y + 26  # 换到下一行
-            if suffix_y_new < 175:  # 确保不超出GPU区域
-                draw.text((base_x, suffix_y_new), suffix, fill=gpu_brand_color, font=fonts['small'])
-
-    gpu_temp_text = f"{info['gpu_temp']:.0f}°"
-    bbox = draw.textbbox((0, 0), gpu_temp_text, font=fonts['medium'])
-    text_w = bbox[2] - bbox[0]
-    draw.text((WIDTH - 20 - text_w, 145), gpu_temp_text, fill=gpu_color, font=fonts['medium'])
-
-    # GPU Temp Progress bar - full width with rounded corners
-    bar_x, bar_y, bar_w, bar_h = 23, 200, WIDTH - 46, 18
-    bar_radius = bar_h // 2  # Fully rounded (half the height)
-    draw_rounded_rect(draw, [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
-                      radius=bar_radius, fill=(30, 30, 38), outline=None)
-    fill_w = int(bar_w * min(info['gpu_temp'] / 100.0, 1.0))
-    if fill_w >= bar_radius * 2:  # Only draw if wide enough for rounded corners
-        draw_rounded_rect(draw, [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h],
-                          radius=bar_radius, fill=gpu_color, outline=None)
-
-    return rgb_to_framebuffer(img)
-
-# ============================================================================
-# Command Functions
-# ============================================================================
-
-def cmd_monitor(device, args):
-    """Display system monitoring continuously"""
-    # Send init command first
-    device.init_query()
+def run_monitor(device, interval):
+    device.initialize()
     time.sleep(0.5)
 
-    print("Displaying system monitor (Ctrl+C to stop)...\n")
-
-    # Load fonts
-    fonts = load_fonts()
-
-    # Create display state
     display_state = DisplayState()
-
-    # Start IPC server
     ipc_server = IPCServer(device, display_state)
     ipc_server.start()
-    print("IPC server started on", SOCKET_PATH)
+    monitor = SystemMonitor()
+    fonts = load_fonts()
+    frame_count = 0
+    print(f"监控已启动，IPC socket: {SOCKET_PATH}")
 
     try:
-        frame_count = 0
         while True:
-            # Check current display mode
-            mode, data = display_state.get_state()
+            mode, framebuffer = display_state.get()
+            if mode == "monitor":
+                snapshot = monitor.sample()
+                framebuffer = render_monitor_framebuffer(snapshot, fonts)
+                status = _format_status(snapshot)
+            else:
+                status = "显示纯色画面"
 
-            if mode == 'monitor':
-                # Generate and display monitoring frame
-                info = get_system_info()
-                framebuffer = render_monitor_display(info, fonts)
+            if framebuffer:
                 device.send_frame(framebuffer)
-
                 frame_count += 1
-                print(f"[MONITOR] Frame {frame_count:4d} | CPU: {info['cpu_temp']:5.1f}°C ({info['cpu_percent']:4.1f}%) | GPU: {info['gpu_temp']:5.1f}°C | {info['cpu_freq']:.2f}GHz", end='\r')
-            elif mode in ['image', 'solid']:
-                # Display static content
-                if data:
-                    device.send_frame(data)
-                    print(f"[{mode.upper()}] Displaying static content...                                                                ", end='\r')
-
-            time.sleep(args.interval)
+            print(f"第 {frame_count:4d} 帧 | {status:<60}", end="\r", flush=True)
+            time.sleep(interval)
     except KeyboardInterrupt:
-        print(f"\n\nStopped after {frame_count} frames")
+        print(f"\n监控已停止，共发送 {frame_count} 帧")
     finally:
         ipc_server.stop()
 
-def cmd_image(device, args):
-    """Display a custom image"""
-    # Try IPC first if service is running
-    if device is None:
-        import base64
-        with open(args.image, 'rb') as f:
-            img_data = base64.b64encode(f.read()).decode('utf-8')
-        response = send_ipc_command({'action': 'image', 'data': img_data})
-        if response and response.get('status') == 'ok':
-            print(f"✓ Displayed image: {args.image}")
-            return
-        elif response:
-            print(f"✗ Error: {response.get('message', 'Unknown error')}")
-            sys.exit(1)
 
-    # Direct USB access
-    device.init_query()
-    time.sleep(0.5)
+def execute_remote(command):
+    response = send_ipc_command(command)
+    if response is None:
+        return False
+    if response.get("status") != "ok":
+        raise RuntimeError(response.get("message", "未知 IPC 错误"))
+    return True
 
-    try:
-        img = Image.open(args.image).convert('RGB')
-        framebuffer = rgb_to_framebuffer(img)
-        device.send_frame(framebuffer)
-        print(f"✓ Displayed image: {args.image}")
-    except Exception as e:
-        print(f"✗ Error loading image: {e}")
-        sys.exit(1)
 
-def cmd_solid(device, args):
-    """Display solid color"""
-    # Try IPC first if service is running
-    if device is None:
-        response = send_ipc_command({'action': 'solid', 'color': args.color})
-        if response and response.get('status') == 'ok':
-            print(f"✓ Displayed solid color: {tuple(args.color)}")
-            return
-        elif response:
-            print(f"✗ Error: {response.get('message', 'Unknown error')}")
-            sys.exit(1)
-
-    # Direct USB access
-    device.init_query()
-    time.sleep(0.5)
-
-    img = Image.new('RGB', (WIDTH, HEIGHT), color=tuple(args.color))
-    framebuffer = rgb_to_framebuffer(img)
-    device.send_frame(framebuffer)
-    print(f"✓ Displayed solid color: {tuple(args.color)}")
-
-def cmd_brightness(device, args):
-    """Adjust brightness"""
-    # Try IPC first if service is running
-    if device is None:
-        action = 'brightness_up' if args.direction == 'up' else 'brightness_down'
-        response = send_ipc_command({'action': action})
-        if response and response.get('status') == 'ok':
-            print(f"✓ Brightness {'increased' if args.direction == 'up' else 'decreased'}")
-            return
-        elif response:
-            print(f"✗ Error: {response.get('message', 'Unknown error')}")
-            sys.exit(1)
-
-    # Direct USB access
-    if args.direction == 'up':
-        device.brightness_up()
-        print("✓ Brightness increased")
-    else:
-        device.brightness_down()
-        print("✓ Brightness decreased")
-
-# ============================================================================
-# Main Entry Point
-# ============================================================================
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Deepcool LM360 LCD Driver',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  sudo deepcool-lm monitor                  # Display live system monitoring (or switch back to it)
-  sudo deepcool-lm monitor --interval 1     # Update every second
-  sudo deepcool-lm image photo.jpg          # Display custom image
-  sudo deepcool-lm solid --color 255 0 0    # Display red screen
-  sudo deepcool-lm brightness up            # Increase brightness
-  sudo deepcool-lm brightness down          # Decrease brightness
-        """
+def connect_device():
+    device = LMDisplay()
+    if device.connect():
+        return device
+    raise RuntimeError(
+        "无法连接 Deepcool LM 设备；请确认 lsusb 可见 3633:0026 且当前用户有 USB 权限"
     )
 
-    subparsers = parser.add_subparsers(dest='command', help='Command to execute')
 
-    # monitor command
-    monitor_parser = subparsers.add_parser('monitor', help='Display system monitoring')
-    monitor_parser.add_argument('--interval', type=float, default=2.0, help='Update interval in seconds (default: 2.0)')
+def main():
+    parser = argparse.ArgumentParser(description="Deepcool LM 系列 LCD Linux 驱动")
+    commands = parser.add_subparsers(dest="command", required=True)
 
-    # image command
-    image_parser = subparsers.add_parser('image', help='Display custom image')
-    image_parser.add_argument('image', help='Path to image file (will be resized to 320x240)')
+    monitor_parser = commands.add_parser("monitor", help="显示实时系统监控")
+    monitor_parser.add_argument(
+        "--interval", type=_positive_interval, default=2.0, help="刷新间隔，默认 2 秒"
+    )
 
-    # solid command
-    solid_parser = subparsers.add_parser('solid', help='Display solid color')
-    solid_parser.add_argument('--color', type=int, nargs=3, metavar=('R', 'G', 'B'),
-                             default=[0, 0, 0], help='RGB color (0-255)')
+    solid_parser = commands.add_parser("solid", help="显示纯色画面")
+    solid_parser.add_argument(
+        "--color",
+        type=_color_channel,
+        nargs=3,
+        metavar=("R", "G", "B"),
+        default=(0, 0, 0),
+        help="RGB 颜色，每项范围 0-255",
+    )
 
-    # brightness command
-    brightness_parser = subparsers.add_parser('brightness', help='Adjust brightness')
-    brightness_parser.add_argument('direction', choices=['up', 'down'], help='Increase or decrease')
+    brightness_parser = commands.add_parser("brightness", help="调节亮度")
+    brightness_parser.add_argument("direction", choices=("up", "down"))
 
     args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        sys.exit(1)
-
-    # For commands that can use IPC, try that first
-    device = None
-    use_ipc_commands = ['image', 'solid', 'brightness', 'monitor']
-
-    # Check if we should use IPC (service is already running)
-    service_running = os.path.exists(SOCKET_PATH)
-
-    if args.command in use_ipc_commands and service_running:
-        # Service is running, use IPC
-        device = None  # Signal to command functions to use IPC
-
-        # Special case: monitor command via IPC just switches back to monitor mode
-        if args.command == 'monitor':
-            response = send_ipc_command({'action': 'monitor'})
-            if response and response.get('status') == 'ok':
-                print("✓ Switched to monitoring mode")
-                sys.exit(0)
-            else:
-                print("✗ Failed to switch to monitoring mode")
-                sys.exit(1)
-    elif args.command == 'monitor' and not service_running:
-        # Starting monitor service directly (not via IPC)
-        device = LM360()
-        if not device.connect():
-            print("✗ Failed to connect to LM360")
-            print("  Make sure:")
-            print("  - Device is plugged in (lsusb | grep 3633)")
-            print("  - Running with sudo")
-            sys.exit(1)
-    else:
-        # Need direct USB access for other commands
-        device = LM360()
-        if not device.connect():
-            print("✗ Failed to connect to LM360")
-            print("  Make sure:")
-            print("  - Device is plugged in (lsusb | grep 3633)")
-            print("  - Running with sudo")
-            sys.exit(1)
-
     try:
-        # Execute command
-        if args.command == 'monitor':
-            cmd_monitor(device, args)
-        elif args.command == 'image':
-            cmd_image(device, args)
-        elif args.command == 'solid':
-            cmd_solid(device, args)
-        elif args.command == 'brightness':
-            cmd_brightness(device, args)
-    finally:
-        if device:
+        if args.command == "monitor":
+            if execute_remote({"action": "monitor"}):
+                print("已切换到监控画面")
+                return
+            device = connect_device()
+            try:
+                run_monitor(device, args.interval)
+            finally:
+                device.disconnect()
+            return
+
+        if args.command == "solid":
+            color = tuple(args.color)
+            if execute_remote({"action": "solid", "color": color}):
+                print(f"已显示纯色画面: {color}")
+                return
+            device = connect_device()
+            try:
+                device.initialize()
+                time.sleep(0.5)
+                device.send_frame(rgb_to_framebuffer(render_solid_image(color)))
+            finally:
+                device.disconnect()
+            print(f"已显示纯色画面: {color}")
+            return
+
+        action = "brightness_up" if args.direction == "up" else "brightness_down"
+        if execute_remote({"action": action}):
+            print("亮度已增加" if args.direction == "up" else "亮度已降低")
+            return
+        device = connect_device()
+        try:
+            device.brightness_up() if args.direction == "up" else device.brightness_down()
+        finally:
             device.disconnect()
+        print("亮度已增加" if args.direction == "up" else "亮度已降低")
+    except RuntimeError as error:
+        parser.exit(1, f"错误: {error}\n")
+
+
+def _receive_all(connection, limit):
+    data = bytearray()
+    while True:
+        chunk = connection.recv(4096)
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+        if len(data) > limit:
+            raise ValueError(f"IPC 消息超过 {limit} 字节")
+
+
+def _validate_color(color):
+    if not isinstance(color, (list, tuple)) or len(color) != 3:
+        raise ValueError("颜色必须包含三个 RGB 数值")
+    if any(type(channel) is not int or not 0 <= channel <= 255 for channel in color):
+        raise ValueError("RGB 数值范围必须为 0-255")
+    return tuple(color)
+
+
+def _color_channel(value):
+    try:
+        channel = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("RGB 必须是整数") from error
+    if not 0 <= channel <= 255:
+        raise argparse.ArgumentTypeError("RGB 数值范围必须为 0-255")
+    return channel
+
+
+def _positive_interval(value):
+    try:
+        interval = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("刷新间隔必须是数字") from error
+    if interval <= 0:
+        raise argparse.ArgumentTypeError("刷新间隔必须大于 0")
+    return interval
+
+
+def _format_status(snapshot):
+    cpu_temp = "N/A" if snapshot.cpu_temp is None else f"{snapshot.cpu_temp:.1f}°C"
+    cpu_usage = (
+        "N/A" if snapshot.cpu_percent is None else f"{snapshot.cpu_percent:.1f}%"
+    )
+    gpu_temp = "N/A" if snapshot.gpu_temp is None else f"{snapshot.gpu_temp:.1f}°C"
+    frequency = "N/A" if snapshot.cpu_freq is None else f"{snapshot.cpu_freq:.2f}GHz"
+    return f"CPU {cpu_temp} ({cpu_usage}) | GPU {gpu_temp} | {frequency}"
+
 
 if __name__ == "__main__":
     main()
