@@ -2,6 +2,8 @@
 
 这是一个通过逆向 Windows 软件的 USB 协议实现的 Linux 驱动，用于在 Deepcool LM 系列水冷屏幕上显示系统监控画面。目前已在 LM240 和 LM360 上验证，设备 VID:PID 为 `3633:0026`，屏幕分辨率为 320x240。
 
+上游项目：[daedlock/deepcool-lm](https://github.com/daedlock/deepcool-lm.git)。当前版本在上游基础上增加了 AMD 硬件支持，改进了硬件信息与传感器检测，并重新设计了 Ark 极简风格界面。
+
 ![浅色主题](preview-light.png)
 ![深色主题](preview-dark.png)
 
@@ -44,6 +46,18 @@ sudo pacman -S pyside6
 ## 安装
 
 ### Arch 软件包
+
+Arch Linux 用户可以通过 AUR 直接安装：
+
+```bash
+yay -S deepcool-lm-arkui
+# 或
+paru -S deepcool-lm-arkui
+```
+
+AUR 包名为 `deepcool-lm-arkui`，与原有的 `deepcool-lm` 包冲突、不可共存；安装后的命令、systemd 服务和文件路径仍使用 `deepcool-lm`。
+
+也可以从当前仓库本地构建：
 
 ```bash
 makepkg -si
