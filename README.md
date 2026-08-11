@@ -235,3 +235,7 @@ sensors
 ```bash
 sudo journalctl -u deepcool-lm -n 50
 ```
+
+## 开发说明
+
+本项目主要通过 AI 辅助开发；人类负责提出需求、确定整体方向并设定关键约束。
